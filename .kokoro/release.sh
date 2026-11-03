@@ -51,6 +51,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Determine project root ---
 if [[ -n "${KOKORO_ARTIFACTS_DIR}" ]]; then
   cd "${KOKORO_ARTIFACTS_DIR}/git/antigravity-sdk-py"
+  # Avoid fatal: detected dubious ownership errors in the Kokoro RBE sandbox environment
+  git config --global --add safe.directory "$(pwd)"
 fi
 
 # If a specific GoB commit was requested (via GOB_COMMIT build param),
@@ -59,15 +61,16 @@ fi
 if [[ -n "${GOB_COMMIT:-}" ]]; then
   echo "--- Pinning SDK source to GoB commit: ${GOB_COMMIT} ---"
   git checkout "${GOB_COMMIT}"
+  git checkout HEAD -- .kokoro/
 fi
 
 PROJECT_DIR="$(pwd)"
 
-# --- Python 3.10 via pyenv (pre-installed on the Kokoro image) ---
-echo "--- Setting up Python 3.10 ---"
+# --- Python 3.13 via pyenv (pre-installed on the Kokoro image) ---
+echo "--- Setting up Python 3.13 ---"
 eval "$(pyenv init -)"
-pyenv install -s 3.10
-pyenv global 3.10
+pyenv install -s 3.13
+pyenv global 3.13
 python3 --version
 
 # --- Read version from pyproject.toml if not set ---
@@ -90,6 +93,9 @@ if [[ -n "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
   (
     export CLOUDSDK_CONFIG="${GCLOUD_TEMP_CONFIG}"
     gcloud config set auth/impersonate_service_account agy-sdk-stager@agy-sdk.iam.gserviceaccount.com
+    # Disable parallel downloads to prevent SQLite token cache lock collisions
+    gcloud config set storage/process_count 1
+    gcloud config set storage/thread_count 1
     gcloud storage cp "${GCS_SOURCE}"/*.whl "${DIST_DIR}/"
   )
   rm -rf "${GCLOUD_TEMP_CONFIG}"
@@ -103,7 +109,7 @@ fi
 
 
 # Install build/release tools with hash verification.
-# See go/pip-install-remediation.
+# See (internal link).
 python3 -m pip install \
   --require-hashes \
   -r "${SCRIPT_DIR}/requirements-release.txt"
@@ -115,10 +121,15 @@ if [[ -z "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
 fi
 
 # --- Platform definitions ---
+# Note: Linux platforms use dual compressed platform tags (manylinux + musllinux per PEP 656).
+# Because localharness is compiled as a static ELF binary, the same wheel is installable
+# across standard glibc Linux distros (matching manylinux) and Alpine Linux (matching musllinux)
+# without building redundant wheel files.
 declare -A PLATFORM_TAGS=(
-  ["linux-x86_64"]="manylinux_2_17_x86_64"
-  ["linux-arm64"]="manylinux_2_17_aarch64"
+  ["linux-x86_64"]="manylinux_2_17_x86_64.musllinux_1_1_x86_64"
+  ["linux-arm64"]="manylinux_2_17_aarch64.musllinux_1_1_aarch64"
   ["darwin-arm64"]="macosx_11_0_arm64"
+  ["darwin-x86_64"]="macosx_11_0_x86_64"
   ["windows-x86_64"]="win_amd64"
   ["windows-arm64"]="win_arm64"
 )
@@ -134,6 +145,7 @@ if [[ -z "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
     ["linux-x86_64"]="localharness_linux_x86_64"
     ["linux-arm64"]="localharness_linux_arm64"
     ["darwin-arm64"]="localharness_darwin_arm64"
+    ["darwin-x86_64"]="localharness_darwin_x86_64"
     ["windows-x86_64"]="localharness_windows_x86_64"
     ["windows-arm64"]="localharness_windows_arm64"
   )
@@ -144,9 +156,6 @@ if [[ -z "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
     if [[ ! -f "${LOCAL_BIN}" ]]; then
       MPM_SUBDIR="${MPM_DIRS[$PLATFORM]:-}"
       MPM_BIN="${MPM_DIR}/${MPM_SUBDIR}/localharness_external"
-      if [[ "${PLATFORM}" == windows-* ]]; then
-        MPM_BIN="${MPM_BIN}.exe"
-      fi
       if [[ -n "${MPM_SUBDIR}" && -f "${MPM_BIN}" ]]; then
         echo "--- Copying ${PLATFORM} binary from MPM ---"
         mkdir -p "${BINARIES_DIR}/${PLATFORM}"
@@ -163,6 +172,11 @@ if [[ -z "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
       fi
     fi
   done
+
+  # Compile protos to python stubs
+  echo "--- Compiling protos ---"
+  python3 -m grpc_tools.protoc -I. --python_out=. google/antigravity/proto/*
+  touch google/antigravity/proto/__init__.py
 
   # --- Build platform-specific wheels ---
   BUILT_ANY=false
@@ -192,6 +206,8 @@ if [[ -z "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
     # discovers it via package-data.
     touch "${BIN_DEST}/__init__.py"
 
+    # Clean setuptools build directory to prevent binary accumulation across platforms.
+    rm -rf build/
     # Build the wheel, then re-tag with the correct platform.
     # --no-isolation: use the setuptools/wheel already installed via
     # requirements-release.txt rather than creating a fresh venv that
@@ -266,7 +282,7 @@ if [[ "${PUBLISH:-}" == "true" || -n "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
   # 2. Manifest upload — triggers promotion from AR staging to public PyPI.
   # The OSS Exit Gate uses a GCS manifest as the "publish now" signal.
   # Uploading this file triggers the Exit Gate to verify and publish all
-  # staged artifacts to pypi.org. See go/oss-exit-gate-release-python.
+  # staged artifacts to pypi.org. See (internal link).
   EG_GCS_BUCKET="gs://oss-exit-gate-prod-projects-bucket/google-antigravity/pypi/manifests"
 
   echo ""
@@ -279,7 +295,7 @@ if [[ "${PUBLISH:-}" == "true" || -n "${PUBLISH_PREBUILT_VERSION:-}" ]]; then
 
   echo "  Manifest uploaded: ${EG_GCS_BUCKET}/${MANIFEST_NAME}"
   echo "  The OSS Exit Gate will now verify and publish to pypi.org."
-  echo "  Monitor progress at: http://go/spng2?q=PROJECT%3Agoogle-antigravity%2Fpypi"
+  echo "  Monitor progress at: (internal link)?q=PROJECT%3Agoogle-antigravity%2Fpypi"
   echo ""
   echo "--- Release v${VERSION} published ---"
 else

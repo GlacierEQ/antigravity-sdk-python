@@ -24,36 +24,13 @@ Conversation directly with any ConnectionStrategy.
 """
 
 import contextlib
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Sequence
 
 from google.antigravity import types
-from google.antigravity.connections import connection
-
+from google.antigravity.connections import connection as connection_lib
 
 # Default maximum number of steps to retain in history.
 _DEFAULT_MAX_HISTORY_SIZE = 10_000
-
-
-def _zero_usage() -> types.UsageMetadata:
-  """Returns a UsageMetadata with all counters set to zero."""
-  return types.UsageMetadata(
-      prompt_token_count=0,
-      cached_content_token_count=0,
-      candidates_token_count=0,
-      thoughts_token_count=0,
-      total_token_count=0,
-  )
-
-
-def _add_usage(
-    target: types.UsageMetadata, source: types.UsageMetadata
-) -> None:
-  """Adds source usage counts into target, treating None as zero."""
-  target.prompt_token_count += source.prompt_token_count or 0
-  target.cached_content_token_count += source.cached_content_token_count or 0
-  target.candidates_token_count += source.candidates_token_count or 0
-  target.thoughts_token_count += source.thoughts_token_count or 0
-  target.total_token_count += source.total_token_count or 0
 
 
 class Conversation:
@@ -65,31 +42,38 @@ class Conversation:
 
   def __init__(
       self,
-      conn: connection.Connection,
+      conn: connection_lib.Connection,
       *,
       max_history_size: int = _DEFAULT_MAX_HISTORY_SIZE,
+      history: Sequence[types.Step] | None = None,
   ):
-    """Initializes the conversation with a connection and empty history.
+    """Initializes the conversation with a connection and optional initial history.
 
     Args:
       conn: The established connection to the agent backend.
       max_history_size: Maximum number of steps to retain in history.
         When exceeded, the oldest steps are discarded. Set to 0 to
         disable the limit.
+      history: Optional initial sequence of steps to seed the conversation
+        history.
     """
     self._connection = conn
     self._steps: list[types.Step] = []
     self._turn_start_indices: list[int] = []
     self._compaction_indices: list[int] = []
     self._max_history_size = max_history_size
-    self._cumulative_usage = _zero_usage()
-    self._turn_usage: types.UsageMetadata | None = None
+    self._turn_start_usage: types.UsageMetadata | None = None
+    for step in history or []:
+      self._steps.append(step)
+      if step.type == types.StepType.COMPACTION:
+        self._compaction_indices.append(len(self._steps) - 1)
+    self._enforce_max_history()
 
   @classmethod
   @contextlib.asynccontextmanager
   async def create(
       cls,
-      strategy: connection.ConnectionStrategy,
+      strategy: connection_lib.ConnectionStrategy,
   ) -> AsyncIterator["Conversation"]:
     """Creates a new conversation.
 
@@ -100,7 +84,8 @@ class Conversation:
       A new Conversation instance.
     """
     async with strategy:
-      yield cls(strategy.connect())
+      conn = strategy.connect()
+      yield cls(conn, history=conn._initial_history)
 
   # ---------------------------------------------------------------------------
   # Core send / receive
@@ -122,7 +107,7 @@ class Conversation:
       prompt: The user message to send.
       **kwargs: Strategy-specific options.
     """
-    if not self._connection.is_idle:
+    if self._connection.is_idle is False:
       try:
         async for _ in self.receive_steps():
           pass
@@ -133,7 +118,7 @@ class Conversation:
         # safe since the active iterator is already preserving steps.
         await self._connection.wait_for_idle()
     self._turn_start_indices.append(len(self._steps))
-    self._turn_usage = None
+    self._turn_start_usage = self._connection.cumulative_usage.model_copy()
     await self._connection.send(prompt, **kwargs)
 
   async def receive_steps(self) -> AsyncIterator[types.Step]:
@@ -152,8 +137,6 @@ class Conversation:
       self._steps.append(step)
       if step.type == types.StepType.COMPACTION:
         self._compaction_indices.append(len(self._steps) - 1)
-      if step.usage_metadata:
-        self._accumulate_usage(step.usage_metadata)
       self._enforce_max_history()
       yield step
 
@@ -173,7 +156,11 @@ class Conversation:
       is_model = step.source == types.StepSource.MODEL
       is_target_user = step.target == types.StepTarget.USER
 
-      if is_model and is_target_user:
+      if (
+          is_model
+          and is_target_user
+          and step.status != types.StepStatus.ERROR
+      ):
         # Yield real-time thought deltas directly
         if step.thinking_delta:
           yield types.Thought(
@@ -190,8 +177,8 @@ class Conversation:
       # ID are always yielded since we cannot determine duplicates.
       if step.tool_calls:
         for call in step.tool_calls:
-          if call.id is None or call.id not in seen_tool_ids:
-            if call.id is not None:
+          if not call.id or call.id not in seen_tool_ids:
+            if call.id:
               seen_tool_ids.add(call.id)
             yield call
 
@@ -270,8 +257,7 @@ class Conversation:
     self._steps.clear()
     self._turn_start_indices.clear()
     self._compaction_indices.clear()
-    self._cumulative_usage = _zero_usage()
-    self._turn_usage = None
+    self._turn_start_usage = None
 
   def _enforce_max_history(self) -> None:
     """Trims history to max_history_size if a limit is set."""
@@ -291,7 +277,7 @@ class Conversation:
       ]
 
   @property
-  def connection(self) -> connection.Connection:
+  def connection(self) -> connection_lib.Connection:
     """Returns the underlying Connection transport.
 
     Intended for advanced use cases that need direct transport access.
@@ -312,26 +298,45 @@ class Conversation:
     return self._connection.conversation_id
 
   @property
-  def total_usage(self) -> types.UsageMetadata:
-    """Returns cumulative token usage across all turns in this session.
+  def sandbox_status(self) -> types.SandboxStatus | None:
+    """Returns the OS command sandbox status reported at handshake, if any."""
+    return self._connection.sandbox_status
 
-    This aggregates usage_metadata from every step that reported it.
-    Individual field values are None if no step ever reported that field.
+  @property
+  def total_usage(self) -> types.UsageMetadata:
+    """Returns cumulative token usage across all turns in this session."""
+    return self._connection.cumulative_usage.model_copy()
+
+  @property
+  def trajectory_usages(self) -> dict[str, types.UsageMetadata]:
+    """Returns a dictionary mapping trajectory ID to cumulative token usage.
+
+    The main agent's trajectory ID matches conversation_id (or 'main').
+    Subagents each have a unique trajectory ID.
     """
-    return self._cumulative_usage.model_copy()
+    return {
+        k: v.model_copy() for k, v in self._connection.trajectory_usages.items()
+    }
 
   @property
   def last_turn_usage(self) -> types.UsageMetadata | None:
-    """Returns token usage accumulated during the most recent turn, or None."""
-    return self._turn_usage.model_copy() if self._turn_usage else None
+    """Returns token usage from the most recent turn, or None."""
+    if self._turn_start_usage is None:
+      return None
+    diff = self._connection.cumulative_usage - self._turn_start_usage
+    if diff.total_token_count == 0:
+      return None
+    return diff
 
-  def _accumulate_usage(self, usage: types.UsageMetadata) -> None:
-    """Adds per-step usage counts to the session-level cumulative totals."""
-    _add_usage(self._cumulative_usage, usage)
+  @property
+  def _last_turn_usage(self) -> types.UsageMetadata | None:
+    """Internal alias for last_turn_usage."""
+    return self.last_turn_usage
 
-    if self._turn_usage is None:
-      self._turn_usage = _zero_usage()
-    _add_usage(self._turn_usage, usage)
+  @property
+  def _last_turn_stop_reason(self) -> types.StopReason:
+    """Returns the stop reason of the most recent turn."""
+    return self._connection._last_turn_stop_reason  # pylint: disable=protected-access
 
   # ---------------------------------------------------------------------------
   # Lifecycle
@@ -340,17 +345,6 @@ class Conversation:
   async def cancel(self) -> None:
     """Cancels the current turn in progress."""
     await self._connection.cancel()
-
-  async def delete(self) -> None:
-    """Deletes this conversation and all associated state from the backend."""
-    await self._connection.delete()
-
-  async def signal_idle(self) -> None:
-    """Signals that the conversation is ready to receive input.
-
-    This is used by the harness to indicate that the agent can proceed.
-    """
-    await self._connection.signal_idle()
 
   async def wait_for_idle(self) -> None:
     """Blocks until the conversation is idle and ready for the next turn."""

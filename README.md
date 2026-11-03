@@ -27,6 +27,69 @@ Get started by running one of the [`examples/`](examples/), such as the
 export GEMINI_API_KEY="your_api_key_here"
 python ./examples/getting_started/hello_world.py
 ```
+## Gemini Enterprise Agent Platform (formerly Vertex AI)
+
+To use the SDK with Gemini Enterprise Agent Platform (formerly Vertex AI),
+the SDK supports two authentication modes:
+
+### 1. Express Mode (API Key)
+
+For fast setup without requiring Google Cloud projects, regional configuration,
+or Application Default Credentials (ADC), provide an API key with `vertex=True`:
+
+```python
+from google.antigravity import Agent, LocalAgentConfig
+
+config = LocalAgentConfig(
+    vertex=True,
+    api_key="your_api_key_here",
+)
+
+async with Agent(config) as agent:
+    response = await agent.chat("Hello!")
+    print(await response.text())
+```
+
+### 2. Standard Mode (Project & Location with ADC)
+
+For enterprise deployments routing to regional endpoints, configure
+`LocalAgentConfig` with `vertex=True`, `project`, and `location`. By default,
+this mode authenticates via Application Default Credentials (ADC).
+
+```python
+from google.antigravity import Agent, LocalAgentConfig
+
+config = LocalAgentConfig(
+    vertex=True,
+    project="your-gcp-project",
+    location="us-central1",
+)
+
+async with Agent(config) as agent:
+    response = await agent.chat("Hello!")
+    print(await response.text())
+```
+
+Alternatively, you can leave these fields unset in `LocalAgentConfig` and
+export the environment variables instead:
+
+```sh
+# Either GOOGLE_GENAI_USE_VERTEXAI or GOOGLE_GENAI_USE_ENTERPRISE enable Vertex.
+export GOOGLE_GENAI_USE_VERTEXAI=True
+export GOOGLE_CLOUD_PROJECT="your-gcp-project"
+export GOOGLE_CLOUD_LOCATION="us-central1"
+```
+
+Explicit kwargs always take precedence over env vars.
+
+Ensure you have authenticated locally before running the agent in Standard Mode:
+
+```sh
+gcloud auth application-default login
+```
+
+See [vertex.py](./examples/getting_started/vertex.py) for a complete example.
+
 ## Concepts
 
 ### Simple Agent
@@ -71,7 +134,7 @@ async def main():
     async with Agent(config) as agent:
         # Returns instantly — does not block
         response = await agent.chat("Write a short poem about space.")
-        
+
         async for token in response:
             sys.stdout.write(token)
             sys.stdout.flush()
@@ -100,15 +163,14 @@ By default, `Agent` runs in **read-only mode** for safety. Pass
 ### Interactive Loop
 
 ```python
-from google.antigravity import Agent, LocalAgentConfig, CapabilitiesConfig
+from google.antigravity import LocalAgentConfig, CapabilitiesConfig
 from google.antigravity.utils.interactive import run_interactive_loop
 
 config = LocalAgentConfig(
     # api_key="your_api_key_here",
     capabilities=CapabilitiesConfig(),
 )
-async with Agent(config) as agent:
-    await run_interactive_loop(agent)
+await run_interactive_loop(config)
 ```
 
 ### Advanced Usage with Conversation
@@ -123,25 +185,23 @@ import asyncio
 from google.antigravity.connections.local import LocalConnectionStrategy
 from google.antigravity.conversation.conversation import Conversation
 from google.antigravity.tools.tool_runner import ToolRunner
-from google.antigravity.types import GeminiConfig
 
 async def main():
     tool_runner = ToolRunner()
     strategy = LocalConnectionStrategy(
         tool_runner=tool_runner,
-        # gemini_config=GeminiConfig(api_key="your_api_key_here"),
     )
-    
+
     async with Conversation.create(strategy) as conversation:
         # High-level: one-call send + collect
         response = await conversation.chat("What files are here?")
         print(await response.text())
-        
+
         # Step history accumulates automatically
         print(f"Total steps: {len(conversation.history)}")
         print(f"Turns: {conversation.turn_count}")
         print(f"Last response: {conversation.last_response}")
-        
+
         # Low-level: streaming steps
         await conversation.send("Tell me more.")
         async for step in conversation.receive_steps():
@@ -167,14 +227,14 @@ config = LocalAgentConfig(system_instructions="You are an expert software archit
 async with Agent(config) as agent:
     # 1. Flat filesystem shortcut (automatically resolves as types.Document)
     pdf_spec = from_file("spec.pdf")
-    
+
     # 2. Direct constructor instantiation (perfect for in-memory raw bytes)
     chart_image = Image(
-        data=b"raw_png_bytes_here", 
-        mime_type="image/png", 
+        data=b"raw_png_bytes_here",
+        mime_type="image/png",
         description="Architecture blueprint"
     )
-    
+
     # Send a mixed list of text instructions and content classes
     prompt = [
         "Analyze this chart against the specification and list three security vulnerabilities:",
@@ -222,7 +282,7 @@ async with Agent(config) as agent:
 Control agent behavior with a declarative policy system:
 
 ```python
-from google.antigravity import Agent, LocalAgentConfig, CapabilitiesConfig
+from google.antigravity import LocalAgentConfig, CapabilitiesConfig
 from google.antigravity.hooks.policy import deny, allow, ask_user, enforce
 from google.antigravity.utils.interactive import run_interactive_loop
 
@@ -236,8 +296,7 @@ config = LocalAgentConfig(
     capabilities=CapabilitiesConfig(),
     policies=policies,
 )
-async with Agent(config) as agent:
-    await run_interactive_loop(agent)
+await run_interactive_loop(config)
 ```
 
 ### Triggers
@@ -246,7 +305,7 @@ Run background tasks that react to external events and push messages into the
 agent:
 
 ```python
-from google.antigravity import Agent, LocalAgentConfig
+from google.antigravity import LocalAgentConfig
 from google.antigravity.triggers import every
 from google.antigravity.utils.interactive import run_interactive_loop
 
@@ -256,8 +315,66 @@ async def check_status(ctx):
 config = LocalAgentConfig(
     triggers=[every(60, check_status)],
 )
-async with Agent(config) as agent:
-    await run_interactive_loop(agent)
+await run_interactive_loop(config)
+```
+
+### Local AI Models
+
+The Antigravity SDK supports local, offline agentic workflows powered by Gemma 4 and LiteRT-LM. By pairing your SDK scripts with local models, you can run LLM-driven tasks completely offline.
+
+> [!NOTE]
+>
+> * Currently, this works best with `gemma-4-26B-A4B-it-gpu.litertlm`. Other `.litertlm` files may not work well, or not work at all.
+> * We recommend at least 24GB of VRAM/shared memory.
+> * We recommend using a 64K context size.
+
+#### Prerequisites and Installation
+
+First, it is recommended to create and activate a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Next, install the Antigravity SDK along with LiteRT-LM:
+
+```bash
+pip install google-antigravity litert-lm
+```
+
+Import the Gemma 4 26B MoE model. Take note of the imported model path (e.g. on MacOS, typically models are imported to USER/.litert-lm/models):
+
+```bash
+litert-lm import \
+  --from-huggingface-repo=litert-community/gemma-4-26B-A4B-it-litert-lm \
+  gemma-4-26B-A4B-it-gpu.litertlm \
+  gemma4-26b
+```
+
+Quick Start for Local Models:
+
+```python
+import asyncio
+import os
+from google.antigravity import Agent, LiteRTAgentConfig
+
+# Point directly to the locally imported LiteRT-LM model path
+MODEL_PATH = os.path.expanduser("~/.litert-lm/models/gemma4-26b/model.litertlm")
+
+async def main():
+    print(f"Using local LiteRT model: {MODEL_PATH}")
+    config = LiteRTAgentConfig(
+        model_path=MODEL_PATH,
+    ).lightweight()
+
+    async with Agent(config) as agent:
+        response = await agent.chat("What files are in the current directory?")
+        async for token in response:
+            print(token, end="", flush=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ## Architecture

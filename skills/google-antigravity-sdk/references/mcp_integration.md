@@ -1,5 +1,5 @@
-<!-- disableFinding(LINK_RELATIVE_G3DOC) -->
-<!-- disableFinding(LINE_OVER_80) -->
+
+
 
 # MCP Integration in Google Antigravity SDK
 
@@ -21,8 +21,8 @@ Google Antigravity SDK supports two main ways to connect to MCP servers:
 
 1.  **Stdio Transport**: The SDK launches and manages the MCP server process,
     communicating over standard input/output.
-2.  **SSE Transport**: The SDK connects to a remote MCP server running as a web
-    service using Server-Sent Events (SSE).
+2.  **Streamable HTTP Transport**: The SDK connects to a remote MCP server
+    running as a web service using Streamable HTTP.
 
 ## Stdio Transport Configuration
 
@@ -49,10 +49,10 @@ async with Agent(config) as agent:
     print(await response.text())
 ```
 
-## SSE Transport Configuration
+## Streamable HTTP Transport Configuration
 
-Use SSE transport when you want to connect to a remote MCP server running as a
-web service.
+Use Streamable HTTP transport when you want to connect to a remote MCP server
+running as a web service.
 
 ### Example
 
@@ -60,9 +60,9 @@ web service.
 from google.antigravity import Agent, LocalAgentConfig, types
 
 mcp_servers = [
-    types.McpSseServer(
-        name="my_sse_server",
-        url="https://example.com/mcp/sse",
+    types.McpStreamableHttpServer(
+        name="my_http_server",
+        url="https://example.com/mcp",
         headers={"Authorization": "Bearer your-token-here"},  # Optional headers
     )
 ]
@@ -101,6 +101,20 @@ stdio_server = types.McpStdioServer(
     command="python3",
     args=["mcp_server.py"],
     disabled_tools=["pirate_divide"],  # All tools except pirate_divide will be exposed
+)
+```
+
+## Configuring Output Size Limits (`mcp_max_output_bytes`)
+
+By default, MCP tool outputs and resource reads larger than `4096` bytes are
+offloaded to a temporary file on disk instead of being inlined directly into the
+model's context. For MCP servers that return large structured payloads or
+when file-read tools (`view_file`) are disabled, you can increase this session
+limit on `CapabilitiesConfig`:
+
+```python
+capabilities = types.CapabilitiesConfig(
+    mcp_max_output_bytes=65536,  # Inline MCP outputs up to 64 KiB
 )
 ```
 

@@ -15,9 +15,14 @@
 """Tests for tool_runner module."""
 
 import asyncio
+import dataclasses
 import threading
+import typing
+from typing import Optional, Union
+from unittest import mock
 
 from absl.testing import absltest
+import pydantic
 
 from google.antigravity import types as sdk_types
 from google.antigravity.tools import tool_runner
@@ -29,6 +34,14 @@ def _sample_tool(arg1: str) -> str:
 
 async def _async_tool(x: int, y: int) -> int:
   return x + y
+
+
+class _CustomData(pydantic.BaseModel):
+  value: int
+
+
+def _tool_with_string_ann(data: "_CustomData") -> int:
+  return data.value
 
 
 class ToolRunnerTest(absltest.TestCase):
@@ -187,8 +200,8 @@ class ToolRunnerTest(absltest.TestCase):
     be executed safely by the ToolRunner.
     Why: Covers manual wrapping use-cases where users need explicit schemas
     attached to synchronous methods.
-    How: Registers a wrapped synchronous placeholder tool, executes it, and asserts
-    expected return string.
+    How: Registers a wrapped synchronous placeholder tool, executes it, and
+      asserts expected return string.
     """
     tool = tool_runner.ToolWithSchema(_sample_tool, {"type": "object"})
     runner = tool_runner.ToolRunner([tool])
@@ -202,13 +215,24 @@ class ToolRunnerTest(absltest.TestCase):
     be executed safely by the ToolRunner.
     Why: Covers manual wrapping use-cases where users need explicit schemas
     attached to asynchronous methods (e.g. MCP tools).
-    How: Registers a wrapped asynchronous placeholder tool, executes it, and asserts
-    expected return sum.
+    How: Registers a wrapped asynchronous placeholder tool, executes it, and
+      asserts expected return sum.
     """
     tool = tool_runner.ToolWithSchema(_async_tool, {"type": "object"})
     runner = tool_runner.ToolRunner([tool])
     result = asyncio.run(runner.execute("_async_tool", x=3, y=4))
     self.assertEqual(result, 7)
+
+  def test_tool_with_schema_async_does_not_use_thread(self):
+    """Verifies that ToolWithSchema with async callable does not use to_thread."""
+    with mock.patch(
+        "asyncio.to_thread", wraps=asyncio.to_thread
+    ) as mock_to_thread:
+      tool = tool_runner.ToolWithSchema(_async_tool, {"type": "object"})
+      runner = tool_runner.ToolRunner([tool])
+      result = asyncio.run(runner.execute("_async_tool", x=3, y=4))
+      self.assertEqual(result, 7)
+      mock_to_thread.assert_not_called()
 
   def test_tools_property(self):
     """Verifies tools property returns a copy of the dictionary."""
@@ -233,6 +257,165 @@ class ToolRunnerTest(absltest.TestCase):
 
     result = asyncio.run(runner.execute("sync_callable", arg1="World"))
     self.assertEqual(result, "Callable World")
+
+  def test_register_callable_object_no_name(self):
+    """Verifies registering a callable object without name uses class name."""
+
+    class SyncCallable:
+
+      def __call__(self, arg1: str) -> str:
+        return f"Callable {arg1}"
+
+    tool = SyncCallable()
+    runner = tool_runner.ToolRunner()
+    runner.register(tool)
+    self.assertEqual(runner.tool_names, ["SyncCallable"])
+
+  def test_tool_with_schema_no_name(self):
+    """Verifies ToolWithSchema handles callable object without __name__."""
+
+    class SyncCallable:
+
+      def __call__(self, arg1: str) -> str:
+        return f"Callable {arg1}"
+
+    tool = SyncCallable()
+    wrapped = tool_runner.ToolWithSchema(tool, {"type": "object"})
+    self.assertEqual(wrapped.__name__, "SyncCallable")
+    self.assertEqual(wrapped.__qualname__, SyncCallable.__qualname__)
+
+  def test_tool_with_schema_preserves_wrapper_metadata(self):
+    """Verifies ToolWithSchema preserves function metadata and __wrapped__."""
+    import inspect  # pylint: disable=g-import-not-at-top
+
+    def custom_func(x: int) -> int:
+      """Custom documentation."""
+      return x * 2
+
+    wrapped = tool_runner.ToolWithSchema(custom_func, {"type": "object"})
+    self.assertEqual(wrapped.__name__, "custom_func")
+    self.assertEqual(wrapped.__doc__, "Custom documentation.")
+    self.assertEqual(wrapped.__module__, custom_func.__module__)
+    self.assertEqual(wrapped.__qualname__, custom_func.__qualname__)
+    self.assertIs(getattr(wrapped, "__wrapped__", None), custom_func)
+    self.assertIs(inspect.unwrap(wrapped), custom_func)
+
+    sig = inspect.signature(wrapped)
+    self.assertEqual(list(sig.parameters.keys()), ["x"])
+    self.assertEqual(sig.return_annotation, int)
+
+    nested = tool_runner.ToolWithSchema(wrapped, {"type": "nested"})
+    self.assertIs(inspect.unwrap(nested), custom_func)
+    self.assertEqual(inspect.signature(nested), sig)
+
+  def test_tool_with_schema_repr(self):
+    """Verifies ToolWithSchema.__repr__ produces an informative string representation."""
+
+    def sample_func(a: int) -> int:
+      return a
+
+    schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+    tool = tool_runner.ToolWithSchema(sample_func, schema)
+    expected = f"ToolWithSchema(fn={sample_func!r}, input_schema={schema!r})"
+    self.assertEqual(repr(tool), expected)
+
+  def test_coerce_args_basic_types(self):
+    """Verifies that _coerce_args converts strings to basic Python types."""
+
+    def _typed_fn(a: int, b: float, c: bool, d: str) -> None:
+      del a, b, c, d
+
+    runner = tool_runner.ToolRunner([_typed_fn])
+    coerced = runner._coerce_args(
+        _typed_fn, {"a": "5", "b": "2.5", "c": "true", "d": "hello"}
+    )
+    self.assertEqual(coerced, {"a": 5, "b": 2.5, "c": True, "d": "hello"})
+    self.assertIsInstance(coerced["a"], int)
+    self.assertIsInstance(coerced["b"], float)
+    self.assertIsInstance(coerced["c"], bool)
+    self.assertIsInstance(coerced["d"], str)
+
+  def test_coerce_args_string_annotations(self):
+    """Verifies that _coerce_args handles string annotations (forward refs)."""
+    runner = tool_runner.ToolRunner([_tool_with_string_ann])
+    coerced = runner._coerce_args(
+        _tool_with_string_ann, {"data": {"value": 42}}
+    )
+    self.assertIn("data", coerced)
+    self.assertIsInstance(coerced["data"], _CustomData)
+    self.assertEqual(coerced["data"].value, 42)
+
+  def test_coerce_args_optional_and_union(self):
+    """Verifies that _coerce_args handles Optional and Union types."""
+
+    def _complex_fn(x: Optional[int], y: Union[int, float]) -> None:
+      del x, y
+
+    runner = tool_runner.ToolRunner([_complex_fn])
+    coerced = runner._coerce_args(_complex_fn, {"x": "10", "y": "3.14"})
+    self.assertEqual(coerced, {"x": 10, "y": 3.14})
+    self.assertIsInstance(coerced["x"], int)
+    self.assertIsInstance(coerced["y"], float)
+
+    coerced_none = runner._coerce_args(_complex_fn, {"x": None, "y": 42})
+    self.assertEqual(coerced_none, {"x": None, "y": 42})
+
+  def test_coerce_args_fallback_on_error(self):
+    """Verifies that _coerce_args retains original values when conversion fails."""
+
+    def _int_fn(count: int) -> None:
+      del count
+
+    runner = tool_runner.ToolRunner([_int_fn])
+    coerced = runner._coerce_args(_int_fn, {"count": "not_an_int"})
+    self.assertEqual(coerced, {"count": "not_an_int"})
+
+  def test_coerce_args_with_tool_with_schema(self):
+    """Verifies that _coerce_args unwraps ToolWithSchema."""
+
+    def _typed_tool(val: int) -> int:
+      return val * 2
+
+    wrapped = tool_runner.ToolWithSchema(_typed_tool, {"type": "object"})
+    runner = tool_runner.ToolRunner([wrapped])
+    coerced = runner._coerce_args(wrapped, {"val": "21"})
+    self.assertEqual(coerced, {"val": 21})
+
+  def test_coerce_args_empty_kwargs(self):
+    """Verifies that _coerce_args short-circuits immediately when kwargs is empty."""
+
+    def _tool(a: int) -> int:
+      return a
+
+    runner = tool_runner.ToolRunner([_tool])
+    with mock.patch.object(
+        tool_runner, "_get_callable_signature_and_hints"
+    ) as mock_get_info:
+      coerced = runner._coerce_args(_tool, {})
+      self.assertEqual(coerced, {})
+      mock_get_info.assert_not_called()
+
+  def test_coerce_args_reuses_cached_signature_and_hints(self):
+    """Verifies that _coerce_args reuses cached callable introspection."""
+
+    def _tool(a: int) -> int:
+      return a
+
+    runner = tool_runner.ToolRunner([_tool])
+    coerced1 = runner._coerce_args(_tool, {"a": "123"})
+    coerced2 = runner._coerce_args(_tool, {"a": "456"})
+    self.assertEqual(coerced1, {"a": 123})
+    self.assertEqual(coerced2, {"a": 456})
+
+  def test_execute_coerces_arguments(self):
+    """Verifies that execute() automatically coerces argument types."""
+
+    def _sum_tool(x: int, y: float) -> float:
+      return x + y
+
+    runner = tool_runner.ToolRunner([_sum_tool])
+    result = asyncio.run(runner.execute("_sum_tool", x="10", y="5.5"))
+    self.assertEqual(result, 15.5)
 
 
 class ProcessToolCallsTest(absltest.TestCase):
@@ -337,6 +520,31 @@ class ProcessToolCallsTest(absltest.TestCase):
     self.assertLen(results, 1)
     self.assertEqual(results[0].result, "ok")
 
+  def test_init_with_tuple_sequence(self):
+    """Verifies that ToolRunner accepts a non-list Sequence of tools."""
+    runner = tool_runner.ToolRunner((_sample_tool, _async_tool))
+    self.assertCountEqual(runner.tool_names, ["_sample_tool", "_async_tool"])
+
+  def test_process_tool_calls_empty(self):
+    """Verifies that an empty sequence of tool calls returns an empty list immediately."""
+    runner = tool_runner.ToolRunner([_sample_tool])
+    results = asyncio.run(runner.process_tool_calls([]))
+    self.assertEqual(results, [])
+    self.assertIsInstance(results, list)
+
+  def test_process_tool_calls_tuple_sequence(self):
+    """Verifies processing tool calls passed as a tuple (non-list Sequence)."""
+    runner = tool_runner.ToolRunner([_sample_tool, _async_tool])
+    results = asyncio.run(
+        runner.process_tool_calls((
+            sdk_types.ToolCall(name="_sample_tool", args={"arg1": "World"}),
+            sdk_types.ToolCall(name="_async_tool", args={"x": 10, "y": 20}),
+        ))
+    )
+    self.assertLen(results, 2)
+    self.assertEqual(results[0].result, "Hello World")
+    self.assertEqual(results[1].result, 30)
+
   def test_process_tool_calls_with_schema(self):
     """Verifies batch processing of ToolWithSchema.
 
@@ -362,7 +570,7 @@ class ProcessToolCallsTest(absltest.TestCase):
 
     What: Checks that ToolResult.exception holds the original exception object.
     Why: OnToolErrorHook needs the original exception type for isinstance
-      dispatch (b/508736962).
+      dispatch.
     How: Processes a call to a tool that raises ValueError and asserts the
       exception field is the original ValueError instance.
     """
@@ -444,6 +652,92 @@ class ProcessToolCallsTest(absltest.TestCase):
     self.assertLen(results, 1)
     self.assertIsNone(results[0].exception)
 
+  def test_process_tool_calls_preserves_metadata(self):
+    """Verifies that id, step_id, and server_name are preserved on ToolResult."""
+    runner = tool_runner.ToolRunner([_sample_tool])
+    results = asyncio.run(
+        runner.process_tool_calls([
+            sdk_types.ToolCall(
+                id="call_123",
+                step_id="step_456",
+                server_name="test_server",
+                name="_sample_tool",
+                args={"arg1": "Antigravity"},
+            )
+        ])
+    )
+    self.assertLen(results, 1)
+    self.assertEqual(results[0].id, "call_123")
+    self.assertEqual(results[0].step_id, "step_456")
+    self.assertEqual(results[0].server_name, "test_server")
+    self.assertEqual(results[0].result, "Hello Antigravity")
+
+  def test_process_tool_calls_failure_preserves_metadata(self):
+    """Verifies that id, step_id, and server_name are preserved on failed ToolResult."""
+
+    def _failing_tool():
+      raise RuntimeError("boom")
+
+    runner = tool_runner.ToolRunner([_failing_tool])
+    results = asyncio.run(
+        runner.process_tool_calls([
+            sdk_types.ToolCall(
+                id="call_fail",
+                step_id="step_fail",
+                server_name="fail_server",
+                name="_failing_tool",
+            )
+        ])
+    )
+    self.assertLen(results, 1)
+    self.assertEqual(results[0].id, "call_fail")
+    self.assertEqual(results[0].step_id, "step_fail")
+    self.assertEqual(results[0].server_name, "fail_server")
+    self.assertEqual(results[0].error, "boom")
+    self.assertIsInstance(results[0].exception, RuntimeError)
+
+  def test_process_tool_calls_unknown_tool_preserves_metadata(self):
+    """Verifies that id, step_id, and server_name are preserved on unknown tool result."""
+    runner = tool_runner.ToolRunner()
+    results = asyncio.run(
+        runner.process_tool_calls([
+            sdk_types.ToolCall(
+                id="call_unknown",
+                step_id="step_unknown",
+                server_name="unknown_server",
+                name="nonexistent_tool",
+            )
+        ])
+    )
+    self.assertLen(results, 1)
+    self.assertEqual(results[0].id, "call_unknown")
+    self.assertEqual(results[0].step_id, "step_unknown")
+    self.assertEqual(results[0].server_name, "unknown_server")
+    self.assertIn("Unknown tool", results[0].error)
+
+  def test_process_tool_calls_default_omitted_metadata(self):
+    """Verifies default/omitted id and server_name remain None across all paths."""
+
+    def _failing_tool():
+      raise RuntimeError("boom")
+
+    runner = tool_runner.ToolRunner([_sample_tool, _failing_tool])
+    results = asyncio.run(
+        runner.process_tool_calls([
+            sdk_types.ToolCall(name="_sample_tool", args={"arg1": "World"}),
+            sdk_types.ToolCall(name="_failing_tool"),
+            sdk_types.ToolCall(name="nonexistent_tool"),
+        ])
+    )
+    self.assertLen(results, 3)
+    for res in results:
+      self.assertIsNone(res.id)
+      self.assertIsNone(res.step_id)
+      self.assertIsNone(res.server_name)
+    self.assertEqual(results[0].result, "Hello World")
+    self.assertEqual(results[1].error, "boom")
+    self.assertIn("Unknown tool", results[2].error)
+
 
 class ContextInjectionTest(absltest.TestCase):
   """Validates ToolContext injection into tools.
@@ -454,7 +748,6 @@ class ContextInjectionTest(absltest.TestCase):
 
   def _make_mock_context(self):
     """Creates a mock ToolContext for testing."""
-    from unittest import mock  # pylint: disable=g-import-not-at-top
     from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
 
     ctx = mock.MagicMock(spec=tool_context.ToolContext)
@@ -518,6 +811,26 @@ class ContextInjectionTest(absltest.TestCase):
     runner.set_context(mock_ctx)
     result = asyncio.run(runner.execute("_async_context_tool", x=5))
     self.assertEqual(result, 10)
+    self.assertIs(received_ctx, mock_ctx)
+
+  def test_tool_with_pep604_union_context_receives_it(self):
+    """Verifies context injection works with PEP 604 union types (X | None)."""
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+
+    received_ctx = None
+
+    def _pep604_context_tool(
+        arg1: str, ctx: tool_context.ToolContext | None
+    ) -> str:
+      nonlocal received_ctx
+      received_ctx = ctx
+      return f"got {arg1}"
+
+    mock_ctx = self._make_mock_context()
+    runner = tool_runner.ToolRunner([_pep604_context_tool])
+    runner.set_context(mock_ctx)
+    result = asyncio.run(runner.execute("_pep604_context_tool", arg1="hello"))
+    self.assertEqual(result, "got hello")
     self.assertIs(received_ctx, mock_ctx)
 
   def test_no_context_set_skips_injection(self):
@@ -632,6 +945,185 @@ class ContextInjectionTest(absltest.TestCase):
     runner.unregister("_ctx_tool")
     self.assertNotIn("_ctx_tool", runner._context_params)
 
+  def test_tool_with_schema_and_context_receives_it(self):
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+    received_ctx = None
+
+    def _context_tool(arg1: str, ctx: tool_context.ToolContext) -> str:
+      nonlocal received_ctx
+      received_ctx = ctx
+      return f"got {arg1}"
+
+    tool = tool_runner.ToolWithSchema(_context_tool, {"type": "object"})
+    mock_ctx = self._make_mock_context()
+    runner = tool_runner.ToolRunner([tool])
+    runner.set_context(mock_ctx)
+    result = asyncio.run(runner.execute("_context_tool", arg1="hello"))
+    self.assertEqual(result, "got hello")
+    self.assertIs(received_ctx, mock_ctx)
+
+  def test_nested_tool_with_schema_and_context_receives_it(self):
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+    received_ctx = None
+
+    def _context_tool(arg1: str, ctx: tool_context.ToolContext) -> str:
+      nonlocal received_ctx
+      received_ctx = ctx
+      return f"got {arg1}"
+
+    tool = tool_runner.ToolWithSchema(
+        tool_runner.ToolWithSchema(_context_tool, {"type": "inner"}),
+        {"type": "outer"},
+    )
+    mock_ctx = self._make_mock_context()
+    runner = tool_runner.ToolRunner([tool])
+    runner.set_context(mock_ctx)
+    result = asyncio.run(runner.execute("_context_tool", arg1="hello"))
+    self.assertEqual(result, "got hello")
+    self.assertIs(received_ctx, mock_ctx)
+
+  def test_is_tool_context_annotation(self):
+    """Verifies that _is_tool_context_annotation handles various annotation forms."""
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+
+    # Direct type
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(tool_context.ToolContext)
+    )
+    # Direct strings
+    self.assertTrue(tool_runner._is_tool_context_annotation("ToolContext"))
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation("tool_context.ToolContext")
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "tool_context_module.ToolContext"
+        )
+    )
+    self.assertTrue(tool_runner._is_tool_context_annotation("agy.ToolContext"))
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation("antigravity.ToolContext")
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "google.antigravity.ToolContext"
+        )
+    )
+    # Union types
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            Optional[tool_context.ToolContext]
+        )
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            Union[tool_context.ToolContext, None]
+        )
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(tool_context.ToolContext | None)
+    )
+    # Stringified unions / optionals
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation("ToolContext | None")
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation("Optional[ToolContext]")
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "Optional[tool_context.ToolContext]"
+        )
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation("Optional[agy.ToolContext]")
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "typing.Optional[ToolContext]"
+        )
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "typing.Union[str, ToolContext]"
+        )
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "typing.Annotated[ToolContext, 'meta']"
+        )
+    )
+    # Annotated types
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            typing.Annotated[tool_context.ToolContext, "meta"]
+        )
+    )
+    # Generic container types (MUST return False)
+    self.assertFalse(
+        tool_runner._is_tool_context_annotation(
+            list[tool_context.ToolContext]
+        )
+    )
+    self.assertFalse(
+        tool_runner._is_tool_context_annotation("list[ToolContext]")
+    )
+    self.assertFalse(
+        tool_runner._is_tool_context_annotation("dict[str, ToolContext]")
+    )
+    self.assertFalse(
+        tool_runner._is_tool_context_annotation("Callable[[ToolContext], None]")
+    )
+    self.assertFalse(
+        tool_runner._is_tool_context_annotation("set[ToolContext | None]")
+    )
+    self.assertFalse(
+        tool_runner._is_tool_context_annotation("tuple[ToolContext, ...]")
+    )
+    self.assertFalse(
+        tool_runner._is_tool_context_annotation(
+            "typing.List[ToolContext] | None"
+        )
+    )
+    # Nested types with commas in Union
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "Union[dict[str, str], ToolContext]"
+        )
+    )
+    # Non-context types
+    self.assertFalse(tool_runner._is_tool_context_annotation(str))
+    self.assertFalse(tool_runner._is_tool_context_annotation(int))
+    self.assertFalse(tool_runner._is_tool_context_annotation("str"))
+    self.assertFalse(tool_runner._is_tool_context_annotation("OtherContext"))
+    self.assertFalse(tool_runner._is_tool_context_annotation(Optional[str]))
+
+  def test_forward_ref_string_context_detection_and_injection(self):
+    """Verifies that forward ref string annotations for ToolContext are injected."""
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+
+    received_ctx = None
+
+    def _string_annotated_tool(
+        query: str, ctx: "tool_context.ToolContext"  # type: ignore[name-defined]
+    ) -> str:
+      nonlocal received_ctx
+      received_ctx = ctx
+      return f"queried:{query}"
+
+    runner = tool_runner.ToolRunner([_string_annotated_tool])
+    self.assertEqual(
+        runner._context_params.get("_string_annotated_tool"), "ctx"
+    )
+
+    mock_ctx = self._make_mock_context()
+    runner.set_context(mock_ctx)
+    result = asyncio.run(
+        runner.execute("_string_annotated_tool", query="test_term")
+    )
+    self.assertEqual(result, "queried:test_term")
+    self.assertIs(received_ctx, mock_ctx)
+
 
 class SchemaGenerationTest(absltest.TestCase):
   """Validates get_public_callable schema generation.
@@ -670,6 +1162,9 @@ class SchemaGenerationTest(absltest.TestCase):
     sig = inspect.signature(public)
     self.assertIn("query", sig.parameters)
     self.assertNotIn("ctx", sig.parameters)
+    self.assertIn("query", getattr(public, "__annotations__", {}))
+    self.assertNotIn("ctx", getattr(public, "__annotations__", {}))
+    self.assertIsNone(tool_runner._find_context_param(public))
 
   def test_public_callable_for_unknown_tool_raises(self):
     """Verifies that get_public_callable raises for unknown tools.
@@ -681,6 +1176,230 @@ class SchemaGenerationTest(absltest.TestCase):
     runner = tool_runner.ToolRunner()
     with self.assertRaises(KeyError):
       runner.get_public_callable("nonexistent")
+
+  def test_public_callable_preserves_tool_with_schema_wrapper(self):
+    import inspect  # pylint: disable=g-import-not-at-top
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+    def _schema_tool(query: str, ctx: tool_context.ToolContext) -> str:
+      del ctx
+      return query
+
+    schema = {"type": "object", "properties": {"query": {"type": "string"}}}
+    tool = tool_runner.ToolWithSchema(_schema_tool, schema)
+    runner = tool_runner.ToolRunner([tool])
+
+    public = runner.get_public_callable("_schema_tool")
+    self.assertIsInstance(public, tool_runner.ToolWithSchema)
+    self.assertEqual(public.input_schema, schema)
+    self.assertEqual(public.__name__, "_schema_tool")
+
+    # Verify signature of the inner callable is modified
+    sig = inspect.signature(public.fn)
+    self.assertIn("query", sig.parameters)
+    self.assertNotIn("ctx", sig.parameters)
+
+  def test_public_callable_handles_nested_tool_with_schema_wrappers(self):
+    import inspect  # pylint: disable=g-import-not-at-top
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+    def _schema_tool(query: str, ctx: tool_context.ToolContext) -> str:
+      del ctx
+      return query
+
+    inner_schema = {"type": "inner"}
+    outer_schema = {"type": "outer"}
+    tool = tool_runner.ToolWithSchema(
+        tool_runner.ToolWithSchema(_schema_tool, inner_schema),
+        outer_schema,
+    )
+    runner = tool_runner.ToolRunner([tool])
+
+    public = runner.get_public_callable("_schema_tool")
+    self.assertIsInstance(public, tool_runner.ToolWithSchema)
+    self.assertEqual(public.input_schema, outer_schema)
+
+    self.assertIsInstance(public.fn, tool_runner.ToolWithSchema)
+    self.assertEqual(public.fn.input_schema, inner_schema)
+
+    # Verify the innermost function has modified signature
+    sig = inspect.signature(public.fn.fn)
+    self.assertIn("query", sig.parameters)
+    self.assertNotIn("ctx", sig.parameters)
+
+  def test_public_callable_preserves_async_ness(self):
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+
+    async def _schema_tool(query: str, ctx: tool_context.ToolContext) -> str:
+      del ctx
+      return query
+
+    runner = tool_runner.ToolRunner([_schema_tool])
+    public = runner.get_public_callable("_schema_tool")
+    self.assertTrue(tool_runner._is_async(public))
+
+  def test_public_callable_invokes_with_positional_and_keyword_args(self):
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+
+    def _sync_tool(
+        a: str, b: int, ctx: tool_context.ToolContext | None = None
+    ) -> str:
+      del ctx
+      return f"{a}:{b}"
+
+    async def _async_tool_with_ctx(
+        a: str, b: int, ctx: tool_context.ToolContext | None = None
+    ) -> str:
+      del ctx
+      return f"{a}:{b}"
+
+    runner = tool_runner.ToolRunner([_sync_tool, _async_tool_with_ctx])
+
+    sync_pub = runner.get_public_callable("_sync_tool")
+    self.assertEqual(sync_pub("foo", 42), "foo:42")
+    self.assertEqual(sync_pub(a="bar", b=10), "bar:10")
+
+    async_pub = runner.get_public_callable("_async_tool_with_ctx")
+    self.assertEqual(asyncio.run(async_pub("foo", 42)), "foo:42")
+    self.assertEqual(asyncio.run(async_pub(a="bar", b=10)), "bar:10")
+
+  def test_tool_with_schema_invokes_with_positional_and_keyword_args(self):
+    def _my_tool(x: int, y: int) -> int:
+      return x * y
+
+    tool = tool_runner.ToolWithSchema(_my_tool, {"type": "object"})
+    self.assertEqual(tool(3, 4), 12)
+    self.assertEqual(tool(x=5, y=6), 30)
+
+  def test_callable_object_context_injection(self):
+    """Verifies that callable class instances receive ToolContext injection."""
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+
+    class CallableWithContext:
+
+      def __call__(
+          self, query: str, ctx: tool_context.ToolContext
+      ) -> str:
+        ctx.set_state("called_with", query)
+        return f"result:{query}"
+
+    tool = CallableWithContext()
+    runner = tool_runner.ToolRunner([tool])
+    ctx = tool_context.ToolContext(mock.MagicMock())
+    runner.set_context(ctx)
+
+    result = asyncio.run(runner.execute("CallableWithContext", query="hello"))
+    self.assertEqual(result, "result:hello")
+    self.assertEqual(ctx.get_state("called_with"), "hello")
+
+  def test_callable_object_argument_coercion(self):
+    """Verifies that callable class instances have their arguments coerced based on type hints."""
+
+    class CallableWithTypes:
+
+      def __call__(self, count: int, enabled: bool) -> tuple[int, bool]:
+        return count, enabled
+
+    tool = CallableWithTypes()
+    runner = tool_runner.ToolRunner([tool])
+
+    result = asyncio.run(
+        runner.execute("CallableWithTypes", count="42", enabled="true")
+    )
+    self.assertEqual(result, (42, True))
+
+  def test_dataclass_callable_object_context_and_coercion(self):
+    """Verifies dataclass tools with typed attributes resolve __call__ hints for context and coercion."""
+    from google.antigravity.tools import tool_context  # pylint: disable=g-import-not-at-top
+
+    @dataclasses.dataclass
+    class StatefulDataclassTool:
+      prefix: str
+      limit: int
+
+      def __call__(
+          self, query: str, count: int, ctx: tool_context.ToolContext
+      ) -> str:
+        ctx.set_state("called_count", count)
+        return f"{self.prefix}:{query}:{count}"
+
+    tool = StatefulDataclassTool(prefix="STORE", limit=100)
+    runner = tool_runner.ToolRunner([tool])
+    ctx = tool_context.ToolContext(mock.MagicMock())
+    runner.set_context(ctx)
+
+    result = asyncio.run(
+        runner.execute("StatefulDataclassTool", query="apples", count="25")
+    )
+    self.assertEqual(result, "STORE:apples:25")
+    self.assertEqual(ctx.get_state("called_count"), 25)
+
+
+class TypeAdapterCachingTest(absltest.TestCase):
+  """Validates TypeAdapter caching and argument coercion optimization."""
+
+  def setUp(self):
+    super().setUp()
+    tool_runner._cached_type_adapter.cache_clear()
+
+  def test_type_adapter_caching(self):
+    """Verifies that _get_type_adapter returns cached instances for repeated calls."""
+    adapter1 = tool_runner._get_type_adapter(int)
+    adapter2 = tool_runner._get_type_adapter(int)
+    self.assertIsNotNone(adapter1)
+    self.assertIs(adapter1, adapter2)
+
+    adapter_model1 = tool_runner._get_type_adapter(_CustomData)
+    adapter_model2 = tool_runner._get_type_adapter(_CustomData)
+    self.assertIsNotNone(adapter_model1)
+    self.assertIs(adapter_model1, adapter_model2)
+
+  def test_repeated_coercion_with_models_and_cache_hits(self):
+    """Verifies that argument coercion functions efficiently and utilizes cache hits."""
+    def _model_tool(item: _CustomData, multiplier: int) -> int:
+      return item.value * multiplier
+
+    runner = tool_runner.ToolRunner([_model_tool])
+    initial_hits = tool_runner._cached_type_adapter.cache_info().hits
+
+    result1 = asyncio.run(
+        runner.execute("_model_tool", item={"value": 10}, multiplier="3")
+    )
+    self.assertEqual(result1, 30)
+
+    # Second execution should hit the cache for both item (_CustomData)
+    # and multiplier (int)
+    result2 = asyncio.run(
+        runner.execute("_model_tool", item={"value": 5}, multiplier="4")
+    )
+    self.assertEqual(result2, 20)
+    second_hits = tool_runner._cached_type_adapter.cache_info().hits
+    self.assertGreater(second_hits, initial_hits)
+
+  def test_unhashable_annotation_coercion(self):
+    """Verifies that unhashable annotations fallback gracefully without raising TypeError."""
+    # Dict metadata makes Annotated unhashable
+    unhashable_type = typing.Annotated[int, {"key": "val"}]
+
+    def _unhashable_tool(val: unhashable_type) -> int:
+      return val * 2
+
+    runner = tool_runner.ToolRunner([_unhashable_tool])
+    result = asyncio.run(runner.execute("_unhashable_tool", val="15"))
+    self.assertEqual(result, 30)
+
+  def test_invalid_annotation_falls_back_uncoerced(self):
+    """Verifies that invalid/uncompilable annotations preserve raw value."""
+    self.assertIsNone(tool_runner._get_type_adapter(object()))
+
+    def _tool_with_invalid_ann(val):
+      return val
+
+    _tool_with_invalid_ann.__annotations__ = {"val": object()}
+
+    runner = tool_runner.ToolRunner([_tool_with_invalid_ann])
+    result = asyncio.run(
+        runner.execute("_tool_with_invalid_ann", val="raw_str")
+    )
+    self.assertEqual(result, "raw_str")
 
 
 if __name__ == "__main__":

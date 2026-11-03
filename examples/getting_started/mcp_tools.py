@@ -19,29 +19,38 @@ using stdio, SSE, and Streamable HTTP transports.
 
 To run:
   python mcp_tools.py
+
+Criteria for correct script performance:
+  1. The script exits cleanly with return code 0 (no unhandled exceptions).
+  2. The agent successfully uses the pirate_multiply tool to multiply numbers.
+  3. The agent respects the safety policy and fails to use the pirate_divide
+     tool when it is denied.
 """
 
 import asyncio
 import os
 
+from google.antigravity import Agent
+from google.antigravity import LocalAgentConfig
 from google.antigravity import types
-from google.antigravity.hooks import policy
 
-from google.antigravity import Agent, LocalAgentConfig
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from resources import mcp_server
+from google.antigravity.hooks import policy
 
 
 async def mcp_stdio() -> None:
   """Showcases the Stdio transport."""
   print("\n  --- Showcasing Stdio Transport ---")
-  mcp_server_path = os.path.join(
-      os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+  mcp_server_path = os.path.abspath(
+      os.path.join(
+          os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+      )
   )
   stdio_server = types.McpStdioServer(
       name="pirate_math",
-      command="python3",
+      command=sys.executable,
       args=[mcp_server_path, "--transport=stdio"],
   )
 
@@ -52,26 +61,6 @@ async def mcp_stdio() -> None:
     print(f"  User: {prompt}")
     response = await my_agent.chat(prompt)
     print(f"  Agent: {await response.text()}")
-
-
-async def mcp_sse() -> None:
-  """Showcases the SSE transport."""
-  print("\n  --- Showcasing SSE Transport ---")
-  async with mcp_server.run("sse") as port:
-    config = LocalAgentConfig(
-        mcp_servers=[
-            types.McpSseServer(
-                name="pirate_math",
-                url=f"http://localhost:{port}/sse",
-            )
-        ]
-    )
-
-    async with Agent(config) as my_agent:
-      prompt = "Use the pirate_multiply tool to multiply 5 and 7."
-      print(f"  User: {prompt}")
-      response = await my_agent.chat(prompt)
-      print(f"  Agent: {await response.text()}")
 
 
 async def mcp_http() -> None:
@@ -97,12 +86,14 @@ async def mcp_http() -> None:
 async def mcp_filtering() -> None:
   """Showcases MCP tool filtering (enabled_tools / disabled_tools)."""
   print("\n  --- Showcasing MCP Tool Filtering (disabled_tools) ---")
-  mcp_server_path = os.path.join(
-      os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+  mcp_server_path = os.path.abspath(
+      os.path.join(
+          os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+      )
   )
   stdio_server = types.McpStdioServer(
       name="pirate_math",
-      command="python3",
+      command=sys.executable,
       args=[mcp_server_path, "--transport=stdio"],
       disabled_tools=["pirate_divide"],
   )
@@ -127,12 +118,14 @@ async def mcp_filtering() -> None:
 async def mcp_policies() -> None:
   """Showcases safety policies for MCP tools using new overloads."""
   print("\n  --- Showcasing MCP Safety Policies ---")
-  mcp_server_path = os.path.join(
-      os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+  mcp_server_path = os.path.abspath(
+      os.path.join(
+          os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+      )
   )
   stdio_server = types.McpStdioServer(
       name="pirate_math",
-      command="python3",
+      command=sys.executable,
       args=[mcp_server_path, "--transport=stdio"],
   )
 
@@ -164,7 +157,6 @@ async def main() -> None:
   await mcp_stdio()
   await mcp_filtering()
   await mcp_policies()
-  await mcp_sse()
   await mcp_http()
 
 

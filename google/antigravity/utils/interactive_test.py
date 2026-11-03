@@ -24,6 +24,7 @@ from google.antigravity import types
 from google.antigravity.connections import local as local_connection
 from google.antigravity.conversation import conversation
 from google.antigravity.hooks import hooks
+from google.antigravity.hooks import policy
 from google.antigravity.utils import interactive
 
 
@@ -277,51 +278,55 @@ class AskUserHandlerTest(unittest.TestCase):
     self.assertFalse(result)
 
 
-class UpgradeToInteractiveConfirmationTest(unittest.IsolatedAsyncioTestCase):
-  """Tests for _upgrade_to_interactive_confirmation."""
+class UpgradePoliciesListTest(unittest.TestCase):
+  """Tests for _upgrade_policies_list."""
 
-  @mock.patch(
-      "google.antigravity.connections."
-      "local.local_connection.LocalConnectionStrategy"
-  )
-  async def test_upgrade_replaces_hook_not_appends(self, mock_strategy_class):
-    """Verifies the upgrade replaces the existing policy hook in-place.
+  def test_upgrade_policies_list(self):
+    """Verifies that deny policies on run_command are converted to ask_user."""
+    deny_policy = policy.deny(types.BuiltinTools.RUN_COMMAND.value)
+    other_policy = policy.allow("other_tool")
+    policies = [deny_policy, other_policy]
 
-    What: Starts an agent with default confirm_run_command() policies, then
-          calls _upgrade_to_interactive_confirmation.
-    Why: The old code appended a new hook, but the original deny hook fired
-         first and short-circuited. The fix must replace it.
-    How: Counts pre_tool_call_decide_hooks before and after upgrade and
-         asserts the count stays the same (replaced, not appended).
-    """
-    mock_strategy_instance = mock.MagicMock()
-    mock_strategy_instance.stop = mock.AsyncMock()
-    mock_strategy_class.return_value = mock_strategy_instance
+    upgraded = interactive._upgrade_policies_list(policies)
+    self.assertEqual(len(upgraded), 2)
+    self.assertEqual(upgraded[0].decision, policy.Decision.ASK_USER)
+    self.assertEqual(upgraded[0].tool, types.BuiltinTools.RUN_COMMAND.value)
+    self.assertEqual(upgraded[1], other_policy)
 
-    config = local_connection.LocalAgentConfig(system_instructions="test")
-    async with agent.Agent(config) as ag:
-      hooks_before = len(ag._hook_runner._pre_tool_call_decide_hooks)
-      interactive._upgrade_to_interactive_confirmation(ag)
-      hooks_after = len(ag._hook_runner._pre_tool_call_decide_hooks)
-      self.assertEqual(hooks_before, hooks_after,
-                       "Upgrade should replace the hook, not append a new one")
+  def test_upgrade_nested_policy_sequences(self):
+    """Verifies that nested policy lists from builders are flattened and upgraded."""
+    policies = [
+        policy.confirm_run_command(),
+    ]
+    upgraded = interactive._upgrade_policies_list(policies)
+    self.assertEqual(len(upgraded), 2)
+    self.assertEqual(upgraded[0].decision, policy.Decision.ASK_USER)
+    self.assertEqual(upgraded[0].tool, types.BuiltinTools.RUN_COMMAND.value)
+    self.assertEqual(upgraded[1].decision, policy.Decision.APPROVE)
+
+  def test_preserves_conditional_deny(self):
+    """Verifies that conditional deny policies (with a `when` predicate) are kept."""
+    p_cond = policy.deny(
+        types.BuiltinTools.RUN_COMMAND.value,
+        when=lambda tc: "rm" in tc.args.get("cmd", ""),
+    )
+    upgraded = interactive._upgrade_policies_list([p_cond])
+    self.assertEqual(len(upgraded), 1)
+    self.assertEqual(upgraded[0].decision, policy.Decision.DENY)
+    self.assertIsNotNone(upgraded[0].when)
+
+  def test_upgrade_auto_policy_preserves_model(self):
+    """Verifies that when an auto policy is upgraded to ASK_USER, the model is preserved."""
+    p_auto = policy.auto(model="my-custom-model")
+    upgraded = interactive._upgrade_policies_list([p_auto])
+    self.assertEqual(len(upgraded), 1)
+    self.assertEqual(upgraded[0].decision, policy.Decision.ASK_USER)
+    self.assertTrue(upgraded[0].auto)
+    self.assertEqual(upgraded[0].model, "my-custom-model")
 
 
 class RunInteractiveLoopTest(unittest.IsolatedAsyncioTestCase):
   """Tests for run_interactive_loop."""
-
-  async def test_run_interactive_loop_before_start(self):
-    """Verifies RuntimeError when agent session is not started.
-
-    What: Calls run_interactive_loop on an unstarted agent.
-    Why: The function requires a live conversation to operate.
-    How: Asserts RuntimeError is raised with an informative message.
-    """
-    ag = agent.Agent(
-        local_connection.LocalAgentConfig(system_instructions="test")
-    )
-    with self.assertRaises(RuntimeError):
-      await interactive.run_interactive_loop(ag)
 
   @mock.patch(
       "google.antigravity.connections."
@@ -364,9 +369,8 @@ class RunInteractiveLoopTest(unittest.IsolatedAsyncioTestCase):
     mock_async_input.side_effect = ["", "hello", "exit"]
 
     config = local_connection.LocalAgentConfig(system_instructions="test")
-    async with agent.Agent(config) as ag:
-      with mock.patch("builtins.print") as mock_print:
-        await interactive.run_interactive_loop(ag)
+    with mock.patch("builtins.print") as mock_print:
+      await interactive.run_interactive_loop(config)
 
     mock_conversation.send.assert_called_once_with("hello")
     mock_print.assert_any_call("Agent: Agent response")
@@ -397,11 +401,345 @@ class RunInteractiveLoopTest(unittest.IsolatedAsyncioTestCase):
     mock_async_input.side_effect = KeyboardInterrupt()
 
     config = local_connection.LocalAgentConfig(system_instructions="test")
-    async with agent.Agent(config) as ag:
-      with mock.patch("builtins.print") as mock_print:
-        await interactive.run_interactive_loop(ag)
+    with mock.patch("builtins.print") as mock_print:
+      await interactive.run_interactive_loop(config)
 
     mock_print.assert_any_call("\nGoodbye!")
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  @mock.patch(
+      "google.antigravity.utils.interactive.async_input",
+      new_callable=mock.AsyncMock,
+  )
+  async def test_run_interactive_loop_appends_ask_question_hook_when_missing(
+      self, mock_async_input, mock_conv_create, mock_strategy_class
+  ):
+    """Verifies that AskQuestionHook is added when not present."""
+    del mock_strategy_class, mock_conv_create  # Unused.
+    mock_async_input.side_effect = ["exit"]
+
+    mock_agent_instance = mock.MagicMock(spec=agent.Agent)
+    mock_agent_instance.__aenter__ = mock.AsyncMock(
+        return_value=mock_agent_instance
+    )
+    mock_agent_instance.__aexit__ = mock.AsyncMock()
+    mock_agent_class = mock.Mock(return_value=mock_agent_instance)
+
+    config = local_connection.LocalAgentConfig(system_instructions="test")
+    self.assertEqual(len(config.hooks), 0)
+
+    with mock.patch("builtins.print"):
+      await interactive.run_interactive_loop(
+          config, agent_class=mock_agent_class
+      )
+
+    mock_agent_class.assert_called_once()
+    called_config = mock_agent_class.call_args[0][0]
+    self.assertEqual(len(called_config.hooks), 1)
+    self.assertIsInstance(called_config.hooks[0], interactive.AskQuestionHook)
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  @mock.patch(
+      "google.antigravity.utils.interactive.async_input",
+      new_callable=mock.AsyncMock,
+  )
+  async def test_run_interactive_loop_does_not_duplicate_ask_question_hook_when_present(
+      self, mock_async_input, mock_conv_create, mock_strategy_class
+  ):
+    """Verifies that AskQuestionHook is not duplicated if already present."""
+    del mock_strategy_class, mock_conv_create  # Unused.
+    mock_async_input.side_effect = ["exit"]
+
+    mock_agent_instance = mock.MagicMock(spec=agent.Agent)
+    mock_agent_instance.__aenter__ = mock.AsyncMock(
+        return_value=mock_agent_instance
+    )
+    mock_agent_instance.__aexit__ = mock.AsyncMock()
+    mock_agent_class = mock.Mock(return_value=mock_agent_instance)
+
+    existing_hook = interactive.AskQuestionHook()
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test", hooks=[existing_hook]
+    )
+
+    with mock.patch("builtins.print"):
+      await interactive.run_interactive_loop(
+          config, agent_class=mock_agent_class
+      )
+
+    mock_agent_class.assert_called_once()
+    called_config = mock_agent_class.call_args[0][0]
+    self.assertEqual(len(called_config.hooks), 1)
+    self.assertIs(called_config.hooks[0], existing_hook)
+
+  @mock.patch(
+      "google.antigravity.utils.interactive.async_input",
+      new_callable=mock.AsyncMock,
+  )
+  async def test_run_interactive_loop_upgrades_agent_behavior_to_interactive(
+      self, mock_async_input
+  ):
+    """Verifies that agent_behavior is upgraded to INTERACTIVE.
+
+    Also verifies that other configured capability fields are preserved.
+    """
+    mock_async_input.side_effect = ["exit"]
+
+    mock_agent_instance = mock.MagicMock(spec=agent.Agent)
+    mock_agent_instance.__aenter__ = mock.AsyncMock(
+        return_value=mock_agent_instance
+    )
+    mock_agent_instance.__aexit__ = mock.AsyncMock()
+    mock_agent_class = mock.Mock(return_value=mock_agent_instance)
+
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test",
+        capabilities=types.CapabilitiesConfig(
+            enable_subagents=True,
+            disabled_tools=[types.BuiltinTools.SEARCH_WEB],
+        ),
+    )
+    self.assertEqual(
+        config.capabilities.agent_behavior, types.AgentBehavior.AUTONOMOUS
+    )
+
+    with mock.patch("builtins.print"):
+      await interactive.run_interactive_loop(
+          config, agent_class=mock_agent_class
+      )
+
+    mock_agent_class.assert_called_once()
+    called_config = mock_agent_class.call_args[0][0]
+    self.assertEqual(
+        called_config.capabilities.agent_behavior,
+        types.AgentBehavior.INTERACTIVE,
+    )
+    self.assertTrue(called_config.capabilities.enable_subagents)
+    self.assertEqual(
+        called_config.capabilities.disabled_tools,
+        [types.BuiltinTools.SEARCH_WEB],
+    )
+
+  @mock.patch(
+      "google.antigravity.utils.interactive.async_input",
+      new_callable=mock.AsyncMock,
+  )
+  async def test_run_interactive_loop_preserves_existing_interactive_behavior(
+      self, mock_async_input
+  ):
+    """Verifies that agent_behavior remains INTERACTIVE if already configured."""
+    mock_async_input.side_effect = ["exit"]
+
+    mock_agent_instance = mock.MagicMock(spec=agent.Agent)
+    mock_agent_instance.__aenter__ = mock.AsyncMock(
+        return_value=mock_agent_instance
+    )
+    mock_agent_instance.__aexit__ = mock.AsyncMock()
+    mock_agent_class = mock.Mock(return_value=mock_agent_instance)
+
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test",
+        capabilities=types.CapabilitiesConfig(
+            agent_behavior=types.AgentBehavior.INTERACTIVE,
+            enable_subagents=True,
+        ),
+    )
+
+    with mock.patch("builtins.print"):
+      await interactive.run_interactive_loop(
+          config, agent_class=mock_agent_class
+      )
+
+    mock_agent_class.assert_called_once()
+    called_config = mock_agent_class.call_args[0][0]
+    self.assertEqual(
+        called_config.capabilities.agent_behavior,
+        types.AgentBehavior.INTERACTIVE,
+    )
+    self.assertTrue(called_config.capabilities.enable_subagents)
+
+
+class FormatStepSpinnerMessageTest(unittest.TestCase):
+  """Tests for _format_step_spinner_message (mock-free)."""
+
+  def test_single_tool_call(self):
+    step = types.Step(
+        type=types.StepType.TOOL_CALL,
+        tool_calls=[types.ToolCall(name="tool_a", args={})],
+    )
+    self.assertEqual(
+        interactive._format_step_spinner_message(step),
+        "Running tool 'tool_a'...",
+    )
+
+  def test_multiple_tool_calls(self):
+    step = types.Step(
+        type=types.StepType.TOOL_CALL,
+        tool_calls=[
+            types.ToolCall(name="tool_a", args={}),
+            types.ToolCall(name="tool_b", args={}),
+        ],
+    )
+    self.assertEqual(
+        interactive._format_step_spinner_message(step),
+        "Running tools 'tool_a', 'tool_b'...",
+    )
+
+  def test_empty_tool_calls(self):
+    step = types.Step(type=types.StepType.TOOL_CALL, tool_calls=[])
+    self.assertEqual(
+        interactive._format_step_spinner_message(step),
+        "Running tool...",
+    )
+
+  def test_compaction_and_reasoning(self):
+    compaction_step = types.Step(type=types.StepType.COMPACTION)
+    self.assertEqual(
+        interactive._format_step_spinner_message(compaction_step),
+        "Compacting context...",
+    )
+    reasoning_step = types.Step(
+        source=types.StepSource.MODEL,
+        thinking_delta="thinking...",
+    )
+    self.assertEqual(
+        interactive._format_step_spinner_message(reasoning_step),
+        "Reasoning...",
+    )
+
+  def test_other_step_returns_none(self):
+    step = types.Step(content="Hello")
+    self.assertIsNone(interactive._format_step_spinner_message(step))
+
+
+class SpinnerInteractionTest(unittest.IsolatedAsyncioTestCase):
+  """Tests for Spinner pausing and resuming during interactions."""
+
+  async def test_spinner_pause_resume(self):
+    """Verifies that Spinner.pause() and resume() correctly control the task."""
+    spinner = interactive.Spinner("Testing")
+    spinner._enabled = True  # Force enabled for test.
+
+    async with spinner:
+      self.assertTrue(spinner.is_running)
+      self.assertIsNotNone(spinner._task)
+      self.assertIs(interactive.Spinner.get_active(), spinner)
+
+      spinner.pause()
+      self.assertFalse(spinner.is_running)
+      self.assertIsNone(spinner._task)
+
+      spinner.resume()
+      self.assertTrue(spinner.is_running)
+      self.assertIsNotNone(spinner._task)
+
+    self.assertIsNone(interactive.Spinner.get_active())
+
+  @mock.patch("builtins.input")
+  async def test_async_input_pauses_active_spinner(self, mock_input):
+    """Verifies that async_input automatically pauses an active spinner."""
+    mock_input.return_value = "hello"
+    spinner = interactive.Spinner("Testing")
+    spinner._enabled = True
+
+    async with spinner:
+      self.assertTrue(spinner.is_running)
+      with (
+          mock.patch.object(
+              spinner, "pause", wraps=spinner.pause
+          ) as mock_pause,
+          mock.patch.object(
+              spinner, "resume", wraps=spinner.resume
+          ) as mock_resume,
+      ):
+        res = await interactive.async_input("prompt> ")
+        self.assertEqual(res, "hello")
+        mock_pause.assert_called_once()
+        mock_resume.assert_called_once()
+        self.assertTrue(spinner.is_running)
+
+  @mock.patch("builtins.input")
+  async def test_ask_user_handler_pauses_active_spinner(self, mock_input):
+    """Verifies that ask_user_handler pauses and resumes the active spinner."""
+    mock_input.return_value = "y"
+    spinner = interactive.Spinner("Testing")
+    spinner._enabled = True
+
+    async with spinner:
+      self.assertTrue(spinner.is_running)
+      with (
+          mock.patch.object(
+              interactive.Spinner,
+              "pause_active",
+              wraps=interactive.Spinner.pause_active,
+          ) as mock_pause,
+          mock.patch.object(
+              interactive.Spinner,
+              "resume_active",
+              wraps=interactive.Spinner.resume_active,
+          ) as mock_resume,
+      ):
+        tc = types.ToolCall(name="test_tool", args={"foo": "bar"})
+        res = await interactive.ask_user_handler(tc)
+        self.assertTrue(res)
+        mock_pause.assert_called()
+        mock_resume.assert_called()
+        self.assertTrue(spinner.is_running)
+
+  @mock.patch("builtins.print")
+  @mock.patch("builtins.input")
+  async def test_ask_user_handler_sanitizes_terminal_output(
+      self, mock_input, mock_print
+  ):
+    """Verifies ANSI escape sequences and control chars are stripped."""
+    mock_input.return_value = "y"
+    tc = types.ToolCall(
+        name="run_\x1b[31mcommand\x07",
+        args={"cmd": "echo\r\x1b[2A\x1b[2K spoofed"},
+    )
+    reason = "Assessor flagged:\x1b[32m risky\x08\x00"
+    res = await interactive.ask_user_handler(tc, reason=reason)
+    self.assertTrue(res)
+    printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
+    self.assertNotIn("\x1b", printed)
+    self.assertNotIn("\r", printed)
+    self.assertNotIn("\x08", printed)
+    self.assertIn("run_command", printed)
+    self.assertIn("Assessor flagged: risky", printed)
+
+  @mock.patch("builtins.print")
+  @mock.patch("builtins.input")
+  async def test_tool_confirmation_hook_sanitizes_terminal_output(
+      self, mock_input, mock_print
+  ):
+    """Verifies ToolConfirmationHook.run strips ANSI escape sequences and control chars."""
+    mock_input.return_value = "y"
+    hook = interactive.ToolConfirmationHook()
+    tc = types.ToolCall(
+        name="tool_\x1b[31mname\x07",
+        args={"arg": "val\r\x1b[2A\x1b[2K spoofed"},
+    )
+    ctx = mock.MagicMock()
+    res = await hook.run(ctx, tc)
+    self.assertTrue(res.allow)
+    printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
+    self.assertNotIn("\x1b", printed)
+    self.assertNotIn("\r", printed)
+    self.assertIn("tool_name", printed)
+
+  def test_sanitize_terminal_text_preserves_newlines_and_tabs(self):
+    r"""Verifies _sanitize_terminal_text strips control chars while keeping \n and \t."""
+    raw = "line1\n\tindented\r\x07\x1b[31mred\x1b[0m"
+    sanitized = interactive._sanitize_terminal_text(raw)  # pylint: disable=protected-access
+    self.assertEqual(sanitized, "line1\n\tindentedred")
 
 
 if __name__ == "__main__":

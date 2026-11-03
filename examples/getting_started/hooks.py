@@ -15,7 +15,8 @@
 """Example demonstrating all supported lifecycle hooks in Google Antigravity SDK.
 
 This example shows how to use decorators to register hooks for various
-lifecycle events, including session, turn, tool, interaction, and compaction.
+lifecycle events, including session, turn, tool, interaction, compaction,
+and stop.
 
 To run:
   python hooks.py
@@ -28,13 +29,16 @@ Criteria for correct script performance:
   4. Tool hooks (pre_tool_call_decide, post_tool_call) fire when the agent
      uses the greet tool.
   5. The on_tool_error hook fires when the agent calls the broken_tool.
+  6. The stop hook fires when the agent finishes, optionally continuing
+     execution by injecting a follow-up system prompt.
 """
 
 import asyncio
 from typing import Any
 
+from google.antigravity import Agent
+from google.antigravity import LocalAgentConfig
 from google.antigravity import types
-from google.antigravity import Agent, LocalAgentConfig
 from google.antigravity.hooks import hooks
 
 # -----------------------------------------------------------------------------
@@ -75,18 +79,27 @@ async def post_turn(data: str) -> None:
 
 @hooks.pre_tool_call_decide
 async def pre_tool(data: types.ToolCall) -> types.HookResult:
-  print(f"\n  [Hook] Pre-tool-call: Approving tool -> {data.name}")
+  print(
+      "\n  [Hook] Pre-tool-call: Approving tool ->"
+      f" {data.name} (call_id={data.id!r})"
+  )
   return types.HookResult(allow=True)
 
 
 @hooks.post_tool_call
 async def post_tool(data: Any) -> None:
-  print(f"\n  [Hook] Post-tool-call: Result -> {data!r}")
+  print(
+      f"\n  [Hook] Post-tool-call: Result -> {data!r}"
+      f" (call_id={getattr(data, 'id', None)!r})"
+  )
 
 
 @hooks.on_tool_error
 async def on_error(data: Exception) -> None:
-  print(f"\n  [Hook] Tool error: {data!r}")
+  print(
+      f"\n  [Hook] Tool error: {data!r}"
+      f" (call_id={getattr(data, 'call_id', None)!r})"
+  )
   return None  # Let the error propagate
 
 
@@ -114,6 +127,36 @@ async def on_interact(
 @hooks.on_compaction
 async def on_compact(data) -> None:
   print(f"\n  [Hook] Context compaction occurred at step: {data!r}")
+
+
+# -----------------------------------------------------------------------------
+# Stop Hook
+# -----------------------------------------------------------------------------
+
+
+@hooks.stop
+async def on_stop(data: types.StopArgs) -> types.StopHookResult:
+  """Decides whether the agent should stop or continue.
+
+  On the first pass (continuation_count=0) of the Mars facts prompt, pushes the
+  agent to elaborate. Otherwise allows the agent to finish immediately.
+  """
+  print(f"\n  [Stop Hook] Fired (continuation_count={data.continuation_count})")
+  print(f"  [Stop Hook] Response preview: {data.response_text[:120]!r}...")
+
+  if "mars" in data.response_text.lower() and data.continuation_count == 0:
+    print("  [Stop Hook] -> CONTINUE: Pushing agent to dig deeper.\n")
+    return types.StopHookResult(
+        decision=types.StopDecision.CONTINUE,
+        reason=(
+            "Great start. Now pick the single most surprising fact you"
+            " mentioned and explain why it matters for future space"
+            " exploration. Be concise."
+        ),
+    )
+
+  print("  [Stop Hook] -> ALLOW_STOP: Agent may finish.\n")
+  return types.StopHookResult(decision=types.StopDecision.ALLOW_STOP)
 
 
 # -----------------------------------------------------------------------------
@@ -148,8 +191,12 @@ async def main() -> None:
           on_error,
           on_interact,
           on_compact,
+          on_stop,
       ],
       tools=[greet, broken_tool],
+      capabilities=types.CapabilitiesConfig(
+          agent_behavior=types.AgentBehavior.INTERACTIVE,
+      ),
   )
 
   async with Agent(config) as my_agent:
@@ -182,6 +229,14 @@ async def main() -> None:
     # 4. Trigger Interaction Hook (Simulated by asking a question)
     print("\n  --- Prompt 4: Interaction ---")
     response = await my_agent.chat("Ask me a multiple-choice trivia question.")
+    print("  Agent Response: ", end="")
+    async for chunk in response:
+      print(chunk, end="")
+    print()
+
+    # 5. Trigger Stop Hook continuation
+    print("\n  --- Prompt 5: Stop Hook (dig deeper) ---")
+    response = await my_agent.chat("Tell me 3 interesting facts about Mars.")
     print("  Agent Response: ", end="")
     async for chunk in response:
       print(chunk, end="")

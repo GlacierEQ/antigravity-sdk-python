@@ -85,16 +85,23 @@ a Go-based local harness.
     - Dispatches session start/end and turn hooks.
     - Supports loading skills from specified paths via `skills_paths`.
     - Supports overriding the application data directory for generated artifacts and media via `app_data_dir`.
+    - Supports configuring model API and output retry behavior with exponential backoff via `retry_config`.
 
 ## Usage Example
 
 ```python
 from google.antigravity.connections.local import LocalConnectionStrategy
-from google.antigravity.types import GeminiConfig
+from google.antigravity.types import GeminiAPIEndpoint, ModelConfig, ModelType
 
 strategy = LocalConnectionStrategy(
     binary_path="/path/to/localharness",
-    gemini_config=GeminiConfig(api_key="..."),
+    models=[
+        ModelConfig(
+            name="gemini-3.8-flash",
+            types=[ModelType.TEXT],
+            endpoint=GeminiAPIEndpoint(api_key="..."),
+        )
+    ],
     skills_paths=["/path/to/skills"],
 )
 

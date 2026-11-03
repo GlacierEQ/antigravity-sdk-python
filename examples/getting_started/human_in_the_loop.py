@@ -19,28 +19,38 @@ for input or clarification using the `AskQuestionHook`.
 
 To run:
   python human_in_the_loop.py
+
+Criteria for correct script performance:
+  1. The script exits cleanly with return code 0 (no unhandled exceptions).
+  2. The agent prompts the user for clarification using the `ask_question` tool.
+  3. The final response from the agent is printed after user input is received.
 """
 
 import asyncio
 import sys
 
-from google.antigravity import Agent, LocalAgentConfig
-from google.antigravity.utils import interactive
+from google.antigravity import Agent
+from google.antigravity import LocalAgentConfig
+from google.antigravity import types
+from google.antigravity.utils import interactive  # pyrefly: ignore[missing-module-attribute]
 
 
 async def main() -> None:
-  # Default config enables all tools, including ASK_QUESTION.
+  # Configure interactive agent behavior to enable interactive tools like
+  # ASK_QUESTION.
   config = LocalAgentConfig(
       system_instructions=(
           "When you need clarification or more information from the user to "
           "fulfill a request, you should use the `ask_question` tool to "
           "prompt them."
-      )
+      ),
+      hooks=[interactive.AskQuestionHook()],
+      capabilities=types.CapabilitiesConfig(
+          agent_behavior=types.AgentBehavior.INTERACTIVE,
+      ),
   )
 
   async with Agent(config) as my_agent:
-    # Register the hook to handle questions from the agent.
-    my_agent.register_hook(interactive.AskQuestionHook())
 
     # We give the agent an ambiguous prompt to encourage it to ask for
     # clarification.

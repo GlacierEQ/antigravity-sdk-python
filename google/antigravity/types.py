@@ -21,38 +21,89 @@ types. They are pure Python Pydantic V2 models with no proto dependencies.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 import enum
+import logging
+import math
 import mimetypes
 import pathlib
-from typing import Annotated, Any, AsyncIterator, Callable, Literal
+from typing import Annotated, Any, AsyncIterator, Callable, ClassVar, Generic, Literal, TypeVar, cast
+import warnings
 
 import pydantic
+import typing_extensions
+
+from google.antigravity import beta as _beta_lib
+from google.antigravity.models import GeminiAPIEndpoint
+from google.antigravity.models import GeminiModelOptions
+from google.antigravity.models import ModelEndpoint
+from google.antigravity.models import ModelTarget
+from google.antigravity.models import ModelType
+from google.antigravity.models import ServiceTier
+from google.antigravity.models import ThinkingLevel
+from google.antigravity.models import VertexEndpoint
+
+_BaseMediaT = TypeVar("_BaseMediaT", bound="_BaseMedia")
+_T = TypeVar("_T")
+
+DEPRECATED_START_SUBAGENT = "start_subagent"
+
+
+class _classproperty(Generic[_T]):  # pylint: disable=invalid-name
+  """Descriptor for class-level properties (such as deprecated enum aliases)."""
+
+  def __init__(self, fget: Callable[[Any], _T]) -> None:
+    self.fget = fget
+    self.__deprecated__ = getattr(fget, "__deprecated__", None)
+
+  def __get__(self, instance: Any, owner: type[Any] | None = None) -> _T:
+    return self.fget(owner if owner is not None else type(instance))
 
 __all__ = [
     "ThinkingLevel",
-    "GenerationConfig",
-    "ModelEntry",
-    "ModelConfig",
-    "GeminiConfig",
+    "ServiceTier",
+    "ModelType",
+    "ModelEndpoint",
+    "GeminiAPIEndpoint",
+    "VertexEndpoint",
+    "GeminiModelOptions",
+    "ModelTarget",
     "SystemInstructionSection",
     "CustomSystemInstructions",
     "TemplatedSystemInstructions",
     "SystemInstructions",
+    "InlineSkill",
+    "SubagentInheritSkillsConfig",
+    "SubagentNoneSkillsConfig",
+    "SubagentOverrideSkillsConfig",
+    "SubagentSkillsConfig",
+    "SubagentConfig",
+    "SubagentCapabilities",
+    "AgentBehavior",
     "BuiltinTools",
+    "RunCommandConfig",
     "CapabilitiesConfig",
+    "CompactionConfig",
+    "ToolOutputTruncationConfig",
+    "ModelAPIRetryConfig",
+    "ModelOutputRetryConfig",
+    "RetryConfig",
+    "SandboxStatus",
+    "SessionContinuationMode",
     "BaseMcpServerConfig",
     "McpStdioServer",
-    "McpSseServer",
     "McpStreamableHttpServer",
     "McpServerConfig",
     "ToolCall",
     "ToolResult",
-    "PythonTool",
     "UsageMetadata",
     "StepType",
     "StepSource",
     "StepTarget",
     "StepStatus",
+    "BudgetScope",
+    "BudgetConfig",
+    "StopReason",
     "Step",
     "HookResult",
     "QuestionResponse",
@@ -61,118 +112,32 @@ __all__ = [
     "AskQuestionEntry",
     "AskQuestionInteractionSpec",
     "AntigravityConnectionError",
+    "AntigravityCancelledError",
     "AntigravityValidationError",
     "AntigravityExecutionError",
-    "TriggerDelivery",
-    "FileChangeKind",
-    "FileChange",
+    "ToolExecutionError",
     "StreamChunk",
     "Thought",
     "Text",
     "ChatResponse",
+    "Image",
+    "Document",
+    "Audio",
+    "Video",
+    "Content",
+    "ContentPrimitive",
+    "from_file",
+    "from_bytes",
+    "SlashCommand",
+    "BuiltinSlashCommandName",
+    "StopDecision",
+    "StopHookResult",
+    "StopArgs",
 ]
 
 # =============================================================================
 # Config types
 # =============================================================================
-
-DEFAULT_MODEL = "gemini-3.5-flash"
-DEFAULT_IMAGE_GENERATION_MODEL = "gemini-3.1-flash-image-preview"
-
-
-class ThinkingLevel(str, enum.Enum):
-  """Thinking level for Gemini models that support extended thinking.
-
-  Controls the amount of reasoning the model performs before responding.
-  See https://ai.google.dev/gemini-api/docs/thinking#thinking-levels for
-  details.
-
-  Attributes:
-    MINIMAL: Minimal thinking.
-    LOW: Low thinking.
-    MEDIUM: Medium thinking.
-    HIGH: High thinking.
-  """
-
-  MINIMAL = "minimal"
-  LOW = "low"
-  MEDIUM = "medium"
-  HIGH = "high"
-
-
-class GenerationConfig(pydantic.BaseModel):
-  """Generation parameters for a model.
-
-  Attributes:
-    thinking_level: Thinking level for models that support extended thinking.
-      When None, the model's default level is used.
-  """
-
-  thinking_level: ThinkingLevel | None = None
-
-
-def _coerce_model_entry(v: "ModelEntry | str") -> "ModelEntry":
-  """Coerce a bare model name string into a ModelEntry."""
-  if isinstance(v, str):
-    return ModelEntry(name=v)
-  return v
-
-
-class ModelEntry(pydantic.BaseModel):
-  """A model with optional auth and generation overrides.
-
-  Attributes:
-    name: Model name (e.g. 'gemini-3.1-pro-preview').
-    api_key: Per-model API key override. Falls back to GeminiConfig.api_key.
-    generation: Generation parameters for this model.
-  """
-
-  name: str
-  api_key: str | None = None
-  generation: GenerationConfig = pydantic.Field(
-      default_factory=GenerationConfig
-  )
-
-
-class ModelConfig(pydantic.BaseModel):
-  """Model selection for each capability.
-
-  Slots accept a bare model name string (coerced to ModelEntry) or
-  a ModelEntry for per-model overrides. After validation, all slots
-  are always ModelEntry.
-
-  Attributes:
-    default: The primary reasoning model.
-    image_generation: The model used for image generation.
-  """
-
-  default: Annotated[
-      ModelEntry, pydantic.BeforeValidator(_coerce_model_entry)
-  ] = pydantic.Field(default_factory=lambda: ModelEntry(name=DEFAULT_MODEL))
-  image_generation: Annotated[
-      ModelEntry, pydantic.BeforeValidator(_coerce_model_entry)
-  ] = pydantic.Field(
-      default_factory=lambda: ModelEntry(name=DEFAULT_IMAGE_GENERATION_MODEL)
-  )
-
-
-class GeminiConfig(pydantic.BaseModel):
-  """Configuration for the Gemini model backend.
-
-  Attributes:
-    api_key: Shared API key for all models. Falls back to $GEMINI_API_KEY if not
-      set. Individual ModelEntry instances can override this.
-    vertex: If True, uses the Vertex AI backend instead of Gemini Developer API.
-    project: GCP Project ID for Vertex AI.
-    location: GCP Location/Region for Vertex AI (e.g., "us-central1").
-    models: Per-modality model selection and configuration.
-  """
-
-  api_key: str | None = None
-  vertex: bool = False
-  project: str | None = None
-  location: str | None = None
-  models: ModelConfig = pydantic.Field(default_factory=ModelConfig)
 
 
 class SystemInstructionSection(pydantic.BaseModel):
@@ -196,6 +161,9 @@ class CustomSystemInstructions(pydantic.BaseModel):
   """
 
   text: str
+  # Optional prompt-section title; renders the text under <title> tags
+  # instead of the generic <System>.
+  title: str | None = None
 
 
 class TemplatedSystemInstructions(pydantic.BaseModel):
@@ -217,6 +185,319 @@ class TemplatedSystemInstructions(pydantic.BaseModel):
 SystemInstructions = CustomSystemInstructions | TemplatedSystemInstructions
 
 
+class AgentBehavior(str, enum.Enum):
+  """Operational execution behavior for an agent.
+
+  Attributes:
+    AUTONOMOUS: Non-interactive, automated execution. The agent must accomplish
+      the task on its own.
+    INTERACTIVE: The agent works collaboratively with a human, asking for
+      clarifications and keeping them in the loop if needed. Enables features
+      like slash commands and planning mode.
+    MINIMAL: Streamlined prompt behavior optimized for small-context and
+      on-device models by filtering system instructions down to core identity,
+      guidelines, and communication style.
+  """
+
+  AUTONOMOUS = "autonomous"
+  INTERACTIVE = "interactive"
+  MINIMAL = "minimal"
+
+
+_MAX_INT32 = 2**31 - 1  # Maximum value for protobuf int32 wire fields
+_MAX_UINT32 = 2**32 - 1  # Maximum value for protobuf uint32 wire fields
+_MAX_INT64 = 2**63 - 1  # Maximum value for protobuf int64 wire fields
+
+
+class ToolOutputTruncationConfig(pydantic.BaseModel):
+  """Configuration for truncating large tool outputs.
+
+  When a tool's output exceeds `max_tokens`, the harness preserves the beginning
+  (prefix) of the output up to the limit and truncates the remainder (tail),
+  appending a notice informing the model that the output was truncated.
+
+  Attributes:
+    max_tokens: Maximum number of estimated tokens for a single tool response.
+      Must be non-negative. Preserves the beginning (prefix) of the tool
+      response and truncates the end (tail). Setting to 0 explicitly disables
+      truncation.
+  """
+
+  max_tokens: int = pydantic.Field(ge=0, le=_MAX_INT32)
+
+
+class RunCommandConfig(pydantic.BaseModel):
+  """Configuration for the builtin run_command tool.
+
+  Attributes:
+    enable_daemons: Whether the agent is authorized to start long-running daemon
+      commands (e.g. background dev servers, watchers) using
+      run_command(IsDaemon=True) without blocking session completion. When True,
+      the IsDaemon argument is exposed on the run_command tool schema. Defaults
+      to False.
+    timeout_seconds: Maximum execution duration in seconds for commands. When
+      None, the default timeout (10 minutes) is used. Defaults to None.
+    enable_sandbox: When True, terminal commands (run_command) are executed
+      inside the OS-level sandbox (exebox). Forwarded to the harness/cortex,
+      which enforces the sandbox at command execution time. Has no effect on
+      platforms/environments where the sandbox is unavailable. Defaults to
+      False.
+  """
+
+  enable_daemons: bool = False
+  timeout_seconds: float | None = pydantic.Field(default=None, gt=0)
+  enable_sandbox: bool = False
+
+
+class SubagentCapabilities(pydantic.BaseModel):
+  """Capabilities configuration for subagents.
+
+  Attributes:
+    agent_behavior: Operational execution behavior for the subagent. In
+      particular, AgentBehavior.AUTONOMOUS incentivizes the agent to solve the
+      task on their own from start to finish, AgentBehavior.INTERACTIVE makes
+      the agent work collaboratively with a human, and AgentBehavior.MINIMAL
+      prunes prompt overhead for small-context models. Defaults to
+      AgentBehavior.AUTONOMOUS.
+    allowed_subagents: Explicit allowlist of subagent names this subagent may
+      directly invoke. When None, all registered subagents are discoverable.
+    enabled_tools: Explicit allowlist of builtin tools to enable. Mutually
+      exclusive with disabled_tools. When None, the harness defaults are used.
+    disabled_tools: Explicit denylist of builtin tools to disable. Mutually
+      exclusive with enabled_tools. When None, the harness defaults are used.
+    run_command_config: Optional configuration for the builtin run_command tool.
+  """
+
+  agent_behavior: AgentBehavior = AgentBehavior.AUTONOMOUS
+  allowed_subagents: list[str] | None = None
+  enabled_tools: list[BuiltinTools] | None = None
+  disabled_tools: list[BuiltinTools] | None = None
+  run_command_config: RunCommandConfig | None = None
+
+  @pydantic.model_validator(mode="after")
+  def _check_mutually_exclusive(self) -> "SubagentCapabilities":
+    if self.enabled_tools is not None and self.disabled_tools is not None:
+      raise ValueError(
+          "enabled_tools and disabled_tools should be mutually exclusive."
+      )
+    return self
+
+  @pydantic.model_validator(mode="after")
+  def _validate_subagents_and_tools(self) -> "SubagentCapabilities":
+    subagent_disabled = (
+        self.disabled_tools is not None
+        and BuiltinTools.INVOKE_SUBAGENT in self.disabled_tools
+        and BuiltinTools.RUN_WORKFLOW in self.disabled_tools
+    ) or (
+        self.enabled_tools is not None
+        and BuiltinTools.INVOKE_SUBAGENT not in self.enabled_tools
+        and BuiltinTools.RUN_WORKFLOW not in self.enabled_tools
+    )
+    if subagent_disabled and self.allowed_subagents is not None:
+      raise ValueError(
+          "allowed_subagents cannot be specified when INVOKE_SUBAGENT is"
+          " disabled or omitted from enabled_tools."
+      )
+    return self
+
+  @pydantic.model_validator(mode="after")
+  def _validate_interactive_tools(self) -> "SubagentCapabilities":
+    if (
+        self.enabled_tools is not None
+        and BuiltinTools.ASK_QUESTION in self.enabled_tools
+        and self.agent_behavior != AgentBehavior.INTERACTIVE
+    ):
+      logging.warning(
+          "BuiltinTools.ASK_QUESTION is enabled on subagent, but"
+          " agent_behavior is not INTERACTIVE. Set"
+          " SubagentCapabilities(agent_behavior=AgentBehavior.INTERACTIVE) if"
+          " interactive question-and-answer behavior is desired."
+      )
+    return self
+
+
+class InlineSkill(pydantic.BaseModel):
+  """Definition of an inline skill.
+
+  Attributes:
+    name: Unique name of the skill (e.g. 'emoji-summarizer').
+    description: Guidance for when the model should select this skill.
+    content: Markdown/text body containing the skill instructions.
+    allowed_tools: Optional list of tool names permitted for this skill.
+    dependent_tools: Optional list of tool names that this skill depends on
+      (loaded dynamically when the skill is looked up).
+    dependent_skills: Optional list of skill names that this skill depends on.
+    metadata: Optional key-value metadata for the skill (e.g. {'visibility':
+      'hidden'}).
+  """
+
+  name: str
+  description: str
+  content: str
+  allowed_tools: list[str] = pydantic.Field(default_factory=list)
+  dependent_tools: list[str] = pydantic.Field(default_factory=list)
+  dependent_skills: list[str] = pydantic.Field(default_factory=list)
+  metadata: dict[str, str] = pydantic.Field(default_factory=dict)
+
+
+class SubagentInheritSkillsConfig(pydantic.BaseModel):
+  """Inherits parent skills, optionally filtered by name or augmented with extra paths.
+
+  Attributes:
+    skill_names: Optional allowlist of skill names inherited from the parent
+      agent. If empty, all parent skills are inherited.
+    extra_skills_paths: Optional additional filesystem paths containing SKILL.md
+      files.
+  """
+
+  skill_names: list[str] = pydantic.Field(default_factory=list)
+  extra_skills_paths: list[str] = pydantic.Field(default_factory=list)
+
+
+class SubagentNoneSkillsConfig(pydantic.BaseModel):
+  """Disables all skills (and lookup_skill) for this subagent."""
+
+
+class SubagentOverrideSkillsConfig(pydantic.BaseModel):
+  """Replaces parent skills with an explicit set of paths and/or inline skills.
+
+  Attributes:
+    skills_paths: Filesystem directories containing SKILL.md files for this
+      subagent.
+    inline_skills: Inline skill definitions scoped exclusively to this subagent.
+  """
+
+  skills_paths: list[str] = pydantic.Field(default_factory=list)
+  inline_skills: list[InlineSkill] = pydantic.Field(default_factory=list)
+
+  @pydantic.model_validator(mode="after")
+  def _validate_non_empty(self) -> "SubagentOverrideSkillsConfig":
+    if not self.skills_paths and not self.inline_skills:
+      raise ValueError(
+          "SubagentOverrideSkillsConfig requires at least one of skills_paths"
+          " or inline_skills to be non-empty. Use SubagentNoneSkillsConfig to"
+          " disable all skills."
+      )
+    return self
+
+
+class SubagentSkillsConfig(pydantic.BaseModel):
+  """Configuration for how a subagent discovers and accesses skills.
+
+  At most one of inherit_config, none_config, or override_config may be set.
+  If unset, the subagent inherits all parent skills by default.
+
+  Attributes:
+    inherit_config: Inherit parent skills (optionally filtered by skill_names).
+    none_config: Disable all skills for this subagent.
+    override_config: Replace parent skills with explicit paths or inline skills.
+  """
+
+  inherit_config: SubagentInheritSkillsConfig | None = None
+  none_config: SubagentNoneSkillsConfig | None = None
+  override_config: SubagentOverrideSkillsConfig | None = None
+
+  @pydantic.model_validator(mode="after")
+  def _validate_oneof(self) -> "SubagentSkillsConfig":
+    set_fields = [
+        f
+        for f in ("inherit_config", "none_config", "override_config")
+        if getattr(self, f) is not None
+    ]
+    if len(set_fields) > 1:
+      raise ValueError(
+          "At most one of inherit_config, none_config, or override_config may"
+          f" be set; got {set_fields}."
+      )
+    return self
+
+
+class SubagentConfig(pydantic.BaseModel):
+  """Configuration for a static subagent.
+
+  Attributes:
+    name: Unique name of the subagent.
+    description: Description of the subagent.
+    system_instructions: Optional system instructions for the subagent. Supports
+      a string or a SystemInstructions. Note that string and
+      TemplatedSystemInstructions inputs will be appended to the subagent's
+      default system instructions, whereas CustomSystemInstructions will
+      completely replace them.
+    capabilities: Optional capabilities config controlling allowed tools. If
+      None, defaults to read-only tools.
+    tools: Optional list of additional custom tools (callable functions or
+      string names) to enable for this subagent.
+    model: Optional model name for this subagent. When specified, forces the
+      subagent to run under the given model instead of inheriting the parent
+      agent's model. Unlike the agent-level `model`, this accepts a name only:
+      subagents always run against the agent-level endpoint.
+    skills_config: Optional configuration for how this subagent discovers and
+      accesses skills (inherit, none, or override).
+  """
+
+  name: str
+  description: str
+  system_instructions: str | SystemInstructions | None = None
+  capabilities: SubagentCapabilities | None = None
+  tools: list[Callable[..., Any] | str] | None = pydantic.Field(
+      default_factory=list
+  )
+  model: str | None = None
+  skills_config: (
+      SubagentSkillsConfig
+      | SubagentInheritSkillsConfig
+      | SubagentNoneSkillsConfig
+      | SubagentOverrideSkillsConfig
+      | None
+  ) = None
+
+  @pydantic.field_validator("skills_config", mode="before")
+  @classmethod
+  def _coerce_skills_config(cls, v: Any) -> Any:
+    if isinstance(v, SubagentInheritSkillsConfig):
+      return SubagentSkillsConfig(inherit_config=v)
+    if isinstance(v, SubagentNoneSkillsConfig):
+      return SubagentSkillsConfig(none_config=v)
+    if isinstance(v, SubagentOverrideSkillsConfig):
+      return SubagentSkillsConfig(override_config=v)
+    if isinstance(v, dict):
+      has_nested = any(
+          k in v for k in ("inherit_config", "none_config", "override_config")
+      )
+      has_inherit = any(k in v for k in ("skill_names", "extra_skills_paths"))
+      has_override = any(k in v for k in ("skills_paths", "inline_skills"))
+      if has_nested and (has_inherit or has_override):
+        raise ValueError(
+            "Cannot mix nested SubagentSkillsConfig keys (inherit_config,"
+            " none_config, override_config) with shorthand keys in the same"
+            " skills_config dict."
+        )
+      if has_nested:
+        return SubagentSkillsConfig.model_validate(v)
+      if has_inherit and has_override:
+        raise ValueError(
+            "Cannot mix SubagentInheritSkillsConfig fields (skill_names,"
+            " extra_skills_paths) and SubagentOverrideSkillsConfig fields"
+            " (skills_paths, inline_skills) in the same skills_config dict."
+        )
+      if has_inherit:
+        return SubagentSkillsConfig(
+            inherit_config=SubagentInheritSkillsConfig.model_validate(v)
+        )
+      if has_override:
+        return SubagentSkillsConfig(
+            override_config=SubagentOverrideSkillsConfig.model_validate(v)
+        )
+      if v:
+        raise ValueError(
+            f"Unrecognized keys in skills_config dict: {sorted(v.keys())}."
+            " Expected either nested keys ('inherit_config', 'none_config',"
+            " 'override_config') or shorthand keys ('skill_names',"
+            " 'extra_skills_paths', 'skills_paths', 'inline_skills')."
+        )
+    return v
+
+
 class BuiltinTools(str, enum.Enum):
   """Identifiers for common connection-provided builtin tools.
 
@@ -229,8 +510,13 @@ class BuiltinTools(str, enum.Enum):
     EDIT_FILE: Edit an existing file.
     RUN_COMMAND: Execute a shell command.
     ASK_QUESTION: Ask the user a clarifying question.
-    START_SUBAGENT: Invoke a subagent.
+    INVOKE_SUBAGENT: Invoke a subagent.
+    START_SUBAGENT: Deprecated alias for INVOKE_SUBAGENT.
+    RUN_WORKFLOW: Execute a multi-agent workflow script.
     GENERATE_IMAGE: Generate or edit images.
+    SEARCH_WEB: Search the web.
+    READ_URL_CONTENT: Read content from a URL.
+    SCHEDULE: Schedule a one-shot timer or recurring cron job.
     FINISH: Finish the conversation and return structured output.
   """
 
@@ -242,22 +528,51 @@ class BuiltinTools(str, enum.Enum):
   EDIT_FILE = "edit_file"
   RUN_COMMAND = "run_command"
   ASK_QUESTION = "ask_question"
-  START_SUBAGENT = "start_subagent"
+  INVOKE_SUBAGENT = "invoke_subagent"
+  RUN_WORKFLOW = "run_workflow"
   GENERATE_IMAGE = "generate_image"
+  SEARCH_WEB = "search_web"
+  READ_URL_CONTENT = "read_url_content"
+  SCHEDULE = "schedule"
   FINISH = "finish"
+
+  def __str__(self) -> str:
+    return self.value
+
+  @_classproperty
+  @typing_extensions.deprecated(
+      "BuiltinTools.START_SUBAGENT is deprecated; use"
+      " BuiltinTools.INVOKE_SUBAGENT instead.",
+      stacklevel=2,
+  )
+  def START_SUBAGENT(cls) -> "BuiltinTools":  # pylint: disable=invalid-name,no-self-argument
+    return cls.INVOKE_SUBAGENT
+
+  @classmethod
+  def _missing_(cls, value: object) -> "BuiltinTools | None":
+    if value == DEPRECATED_START_SUBAGENT:
+      warnings.warn(
+          f"{DEPRECATED_START_SUBAGENT!r} is deprecated; use"
+          f" {cls.INVOKE_SUBAGENT.value!r} instead.",
+          DeprecationWarning,
+          stacklevel=3,
+      )
+      return cls.INVOKE_SUBAGENT
+    return None
 
   @classmethod
   def read_only(cls) -> list["BuiltinTools"]:
     """Returns tools that only read state (no writes, deletes, or commands).
 
+    Excludes LIST_DIR, SEARCH_DIR, and FIND_FILE, which are disabled by default.
+
     Returns:
-        A list of read-only BuiltinTools.
+        A list of default read-only BuiltinTools.
     """
     return [
-        cls.LIST_DIR,
-        cls.SEARCH_DIR,
-        cls.FIND_FILE,
         cls.VIEW_FILE,
+        cls.READ_URL_CONTENT,
+        cls.SCHEDULE,
         cls.FINISH,
     ]
 
@@ -265,19 +580,22 @@ class BuiltinTools(str, enum.Enum):
   def nondestructive(cls) -> list["BuiltinTools"]:
     """Returns tools that cannot delete content.
 
+    Excludes LIST_DIR, SEARCH_DIR, and FIND_FILE, which are disabled by default.
+
     Returns:
-        A list of non-destructive BuiltinTools.
+        A list of default non-destructive BuiltinTools.
     """
     return [
-        cls.LIST_DIR,
-        cls.SEARCH_DIR,
-        cls.FIND_FILE,
         cls.VIEW_FILE,
         cls.CREATE_FILE,
         cls.EDIT_FILE,
         cls.ASK_QUESTION,
-        cls.START_SUBAGENT,
+        cls.INVOKE_SUBAGENT,
+        cls.RUN_WORKFLOW,
         cls.GENERATE_IMAGE,
+        cls.SEARCH_WEB,
+        cls.READ_URL_CONTENT,
+        cls.SCHEDULE,
         cls.FINISH,
     ]
 
@@ -315,6 +633,65 @@ class BuiltinTools(str, enum.Enum):
     """
     return []
 
+  @classmethod
+  def minimal(cls) -> list["BuiltinTools"]:
+    """Returns the minimal set of software engineering tools.
+
+    Includes run_command, view_file, create_file, and edit_file.
+
+    Returns:
+        A list of minimal BuiltinTools.
+    """
+    return [
+        cls.RUN_COMMAND,
+        cls.VIEW_FILE,
+        cls.CREATE_FILE,
+        cls.EDIT_FILE,
+    ]
+
+  @classmethod
+  def deprecated(cls) -> list["BuiltinTools"]:
+    """Returns deprecated/legacy builtin tools that are disabled by default.
+
+    Includes LIST_DIR, SEARCH_DIR, and FIND_FILE, which are excluded from
+    default tool collections and only enabled when explicitly requested via
+    `enabled_tools`.
+
+    Returns:
+        A list of deprecated BuiltinTools.
+    """
+    return [
+        cls.LIST_DIR,
+        cls.SEARCH_DIR,
+        cls.FIND_FILE,
+    ]
+
+  @classmethod
+  def default(cls) -> list["BuiltinTools"]:
+    """Returns the default set of builtin tools for autonomous agents.
+
+    Excludes ASK_QUESTION (because autonomous agents cannot prompt the user) as
+    well as deprecated tools (LIST_DIR, SEARCH_DIR, and FIND_FILE, which are off
+    by default).
+
+    Returns:
+        A list of default BuiltinTools.
+    """
+    excluded = {cls.ASK_QUESTION, *cls.deprecated()}
+    return [t for t in cls if t not in excluded]
+
+
+BuiltinTools._member_map_["START_SUBAGENT"] = BuiltinTools.INVOKE_SUBAGENT  # pylint: disable=protected-access
+
+
+def normalize_builtin_tool_name(
+    name: BuiltinTools | str, *, server_name: str | None = None
+) -> BuiltinTools | str:
+  """Normalizes deprecated builtin tool name aliases unless scoped to an MCP server."""
+  if name == DEPRECATED_START_SUBAGENT and not server_name:
+    return BuiltinTools.INVOKE_SUBAGENT.value
+  return name
+
 
 class CapabilitiesConfig(pydantic.BaseModel):
   """General agent capability configuration.
@@ -341,27 +718,79 @@ class CapabilitiesConfig(pydantic.BaseModel):
 
   Attributes:
     enable_subagents: Whether the agent can spawn and delegate to sub-agents.
+    agent_behavior: Operational execution behavior for the agent. In particular,
+      AgentBehavior.AUTONOMOUS incentivizes the agent to solve the task on their
+      own from start to finish, AgentBehavior.INTERACTIVE makes the agent work
+      collaboratively with a human, and AgentBehavior.MINIMAL prunes prompt
+      overhead for small-context models. Defaults to AgentBehavior.AUTONOMOUS.
     enabled_tools: Explicit allowlist of builtin tools to enable. Mutually
       exclusive with disabled_tools. When None, the harness defaults are used
-      (all tools enabled). Disabled tools are removed from the model's context,
-      saving tokens and preventing the model from even considering them.
+      (all tools enabled except ASK_QUESTION, LIST_DIR, SEARCH_DIR, and
+      FIND_FILE). Disabled tools are removed from the model's context, saving
+      tokens and preventing the model from even considering them.
     disabled_tools: Explicit denylist of builtin tools to disable. Mutually
-      exclusive with enabled_tools. When None, the harness defaults are used
-      (all tools enabled). Disabled tools are removed from the model's context,
-      saving tokens and preventing the model from even considering them.
-    compaction_threshold: Token count after which the context window may be
-      compacted. When None, the backend's default is used.
-    image_model: The model to use for image generation. Defaults to
-      'gemini-3.1-flash-image-preview'.
+      exclusive with enabled_tools. When specified, the given tools are
+      subtracted from default() (which already excludes ASK_QUESTION, LIST_DIR,
+      SEARCH_DIR, and FIND_FILE). When None, all default tools are enabled.
+      Disabled tools are removed from the model's context, saving tokens and
+      preventing the model from even considering them. Note that to enable
+      ASK_QUESTION, LIST_DIR, SEARCH_DIR, or FIND_FILE, they must be explicitly
+      included in enabled_tools.
+    compaction_threshold: (Deprecated) Configure
+      CompactionConfig(token_threshold=...) directly on AgentConfig instead.
     finish_tool_schema_json: Optional JSON schema string for the finish tool.
+    max_subagent_depth: Global maximum subagent recursion depth for the session.
+      When None, defaults to 1 (flat single-level delegation).
+    allowed_subagents: Explicit allowlist of subagent names the root agent may
+      directly invoke. When None, all registered subagents are discoverable.
+    run_command_config: Optional configuration for the builtin run_command tool.
+    tool_output_truncation_config: Optional configuration or token limit for
+      truncating large tool outputs (preserves beginning, truncates end).
+    mcp_max_output_bytes: Maximum size in bytes of an MCP tool output or
+      resource read before the runtime spills the output to a file on disk
+      instead of inlining it in the model context. Must be positive when
+      specified. When None, the runtime's default limit (4096 bytes) is used.
   """
 
   enable_subagents: bool = True
+  agent_behavior: AgentBehavior = AgentBehavior.AUTONOMOUS
   enabled_tools: list[BuiltinTools] | None = None
   disabled_tools: list[BuiltinTools] | None = None
-  compaction_threshold: int | None = None
-  image_model: str = "gemini-3.1-flash-image-preview"
+  compaction_threshold: int | None = pydantic.Field(
+      default=None,
+      gt=0,
+      deprecated=(
+          "CapabilitiesConfig.compaction_threshold is deprecated. Configure"
+          " CompactionConfig(token_threshold=...) directly on AgentConfig"
+          " instead."
+      ),
+  )
   finish_tool_schema_json: str | None = None
+  max_subagent_depth: int | None = pydantic.Field(default=None, ge=1)
+  allowed_subagents: list[str] | None = None
+  run_command_config: RunCommandConfig | None = None
+  tool_output_truncation_config: ToolOutputTruncationConfig | None = None
+  mcp_max_output_bytes: int | None = pydantic.Field(
+      default=None, gt=0, le=_MAX_INT32
+  )
+
+  @pydantic.field_validator("tool_output_truncation_config", mode="before")
+  @classmethod
+  def _validate_tool_output_truncation_config(
+      cls, v: Any
+  ) -> ToolOutputTruncationConfig | None:
+    if v is None:
+      return None
+    if isinstance(v, int) and not isinstance(v, bool):
+      return ToolOutputTruncationConfig(max_tokens=v)
+    if isinstance(v, ToolOutputTruncationConfig):
+      return v
+    if isinstance(v, dict):
+      return ToolOutputTruncationConfig.model_validate(v)
+    raise TypeError(
+        "tool_output_truncation_config must be an int or"
+        f" ToolOutputTruncationConfig, got {type(v).__name__}"
+    )
 
   @pydantic.model_validator(mode="after")
   def _check_mutually_exclusive(self) -> "CapabilitiesConfig":
@@ -370,6 +799,145 @@ class CapabilitiesConfig(pydantic.BaseModel):
           "enabled_tools and disabled_tools should be mutually exclusive."
       )
     return self
+
+  @pydantic.model_validator(mode="after")
+  def _validate_subagents_and_tools(self) -> "CapabilitiesConfig":
+    subagent_disabled = (
+        not self.enable_subagents
+        or (
+            self.disabled_tools is not None
+            and BuiltinTools.INVOKE_SUBAGENT in self.disabled_tools
+            and BuiltinTools.RUN_WORKFLOW in self.disabled_tools
+        )
+        or (
+            self.enabled_tools is not None
+            and BuiltinTools.INVOKE_SUBAGENT not in self.enabled_tools
+            and BuiltinTools.RUN_WORKFLOW not in self.enabled_tools
+        )
+    )
+    if subagent_disabled:
+      if self.max_subagent_depth is not None:
+        raise ValueError(
+            "max_subagent_depth cannot be configured when subagents are"
+            " disabled (enable_subagents=False or INVOKE_SUBAGENT not enabled)."
+        )
+      if self.allowed_subagents is not None:
+        raise ValueError(
+            "allowed_subagents cannot be specified when subagents are disabled."
+        )
+    return self
+
+  @pydantic.model_validator(mode="after")
+  def _validate_interactive_tools(self) -> "CapabilitiesConfig":
+    if (
+        self.enabled_tools is not None
+        and BuiltinTools.ASK_QUESTION in self.enabled_tools
+        and self.agent_behavior != AgentBehavior.INTERACTIVE
+    ):
+      logging.warning(
+          "BuiltinTools.ASK_QUESTION is enabled, but agent_behavior is not"
+          " INTERACTIVE. Set"
+          " CapabilitiesConfig(agent_behavior=AgentBehavior.INTERACTIVE) if"
+          " interactive question-and-answer behavior is desired."
+      )
+    return self
+
+  def _get_explicit_compaction_threshold(self) -> int | None:
+    """Returns `compaction_threshold` if explicitly configured, bypassing its deprecated descriptor."""
+    if "compaction_threshold" not in self.model_fields_set:
+      return None
+    return self.__dict__.get("compaction_threshold")
+
+  @pydantic.model_validator(mode="after")
+  def _warn_deprecated_compaction_fields(self) -> "CapabilitiesConfig":
+    if self._get_explicit_compaction_threshold() is not None:
+      warnings.warn(
+          "CapabilitiesConfig.compaction_threshold is deprecated. Configure"
+          " CompactionConfig(token_threshold=...) directly on"
+          " AgentConfig instead.",
+          category=DeprecationWarning,
+          stacklevel=2,
+      )
+    return self
+
+
+class CompactionConfig(pydantic.BaseModel):
+  """Configuration for conversation trajectory compaction and context limits.
+
+  Antigravity manages context by compacting older conversation history when
+  the active trajectory exceeds `token_threshold`.
+
+  Attributes:
+    token_threshold: Token ceiling allowed for the conversation history before
+      compaction occurs. When None, the backend's default limit is used.
+  """
+
+  token_threshold: int | None = pydantic.Field(default=None, gt=0)
+
+
+class ModelAPIRetryConfig(pydantic.BaseModel):
+  """Configuration for API retry behavior with exponential backoff.
+
+  Attributes:
+    max_retries: The maximum number of retries for transient API errors.
+    initial_sleep_duration_ms: The initial sleep duration in milliseconds.
+    exponential_multiplier: The multiplier for exponential backoff.
+    jitter_range: The range for jitter when calculating backoff.
+  """
+
+  max_retries: int | None = pydantic.Field(default=None, ge=0, le=_MAX_UINT32)
+  initial_sleep_duration_ms: int | None = pydantic.Field(
+      default=None, ge=0, le=_MAX_UINT32
+  )
+  exponential_multiplier: float | None = pydantic.Field(default=None, ge=0.0)
+  jitter_range: float | None = pydantic.Field(default=None, ge=0.0)
+
+
+class ModelOutputRetryConfig(pydantic.BaseModel):
+  """Configuration for model output retry behavior.
+
+  Attributes:
+    max_retries: The maximum number of retries for malformed model outputs.
+  """
+
+  max_retries: int | None = pydantic.Field(default=None, ge=0, le=_MAX_UINT32)
+
+
+class RetryConfig(pydantic.BaseModel):
+  """Combined retry configuration for model API calls and output validation.
+
+  When `retry_config` is omitted (or fields are left as None), the backend
+  automatically applies built-in interactive defaults (e.g., standard API retry
+  counts, exponential backoff, and model output validation attempts). You only
+  need to provide explicit configuration when overriding these system defaults.
+
+  Attributes:
+    api_retry: Optional configuration for API retry behavior with exponential
+      backoff.
+    model_output_retry: Optional configuration for model output retry behavior.
+  """
+
+  api_retry: ModelAPIRetryConfig | None = None
+  model_output_retry: ModelOutputRetryConfig | None = None
+
+  @classmethod
+  def benchmark(cls) -> "RetryConfig":
+    """Optimized for evaluation suites, automated benchmarks, and load testing.
+
+    Uses unbounded retry tolerance (max uint32: 4,294,967,295 attempts) for
+    transient API errors (429 rate limits, 503 service throttling) to prevent
+    quota issues from crashing evaluation suites, while relying on the default
+    localharness model output retry behavior to remain consistent with
+    production product performance.
+
+    Returns:
+      A RetryConfig configured for benchmark and eval workflows.
+    """
+    return cls(
+        api_retry=ModelAPIRetryConfig(
+            max_retries=_MAX_UINT32, initial_sleep_duration_ms=1000
+        )
+    )
 
 
 class BaseMcpServerConfig(pydantic.BaseModel):
@@ -380,17 +948,29 @@ class BaseMcpServerConfig(pydantic.BaseModel):
       ^[a-zA-Z0-9_-]+$, which aligns with the naming constraints of the Gemini
       API tool naming specification (only alphanumeric characters, hyphens, and
       underscores are permitted).
+    timeout_seconds: Optional timeout in seconds for connecting to the server
+      and listing tools.
+    enabled_tools: Explicit allowlist of tools to enable. Mutually exclusive
+      with disabled_tools. When None, all tools from the server are enabled.
+      Only enabled tools are exposed to the model; others are hidden entirely
+      from the model's context, saving tokens.
+    disabled_tools: Explicit denylist of tools to disable. Mutually exclusive
+      with enabled_tools. When None, all tools from the server are enabled.
+      Disabled tools are removed from the model's context entirely, saving
+      tokens and preventing the model from even considering them.
+    force_all_tools_eager: When True, forces all tools from this server to be
+      loaded eagerly into the model's prompt rather than lazily via tool search.
   """
 
   name: Annotated[str, pydantic.Field(pattern=r"^[a-zA-Z0-9_-]+$")]
+  timeout_seconds: int | None = None
+  enabled_tools: list[str] | None = None
+  disabled_tools: list[str] | None = None
+  force_all_tools_eager: bool = False
 
   @pydantic.model_validator(mode="after")
   def _check_mutually_exclusive(self) -> "BaseMcpServerConfig":
-    # Use getattr to dynamically check subclass fields without causing pytype
-    # errors
-    enabled_tools = getattr(self, "enabled_tools", None)
-    disabled_tools = getattr(self, "disabled_tools", None)
-    if enabled_tools is not None and disabled_tools is not None:
+    if self.enabled_tools is not None and self.disabled_tools is not None:
       raise ValueError(
           "enabled_tools and disabled_tools should be mutually exclusive."
       )
@@ -405,46 +985,14 @@ class McpStdioServer(BaseMcpServerConfig):
     name: Unique identifier for this MCP server.
     type: The type of connection, always "stdio".
     args: Arguments to pass to the command.
-    enabled_tools: Explicit allowlist of tools to enable. Mutually exclusive
-      with disabled_tools. When None, all tools from the server are enabled.
-      Only enabled tools are exposed to the model; others are hidden entirely
-      from the model's context, saving tokens.
-    disabled_tools: Explicit denylist of tools to disable. Mutually exclusive
-      with enabled_tools. When None, all tools from the server are enabled.
-      Disabled tools are removed from the model's context entirely, saving
-      tokens and preventing the model from even considering them.
+    env: Environment variables to merge into the spawned subprocess's
+      environment.
   """
 
   command: str
   type: Literal["stdio"] = "stdio"
   args: list[str] = pydantic.Field(default_factory=list)
-  enabled_tools: list[str] | None = None
-  disabled_tools: list[str] | None = None
-
-
-class McpSseServer(BaseMcpServerConfig):
-  """Configuration for an MCP server connected via SSE.
-
-  Attributes:
-    url: The URL of the SSE endpoint.
-    name: Unique identifier for this MCP server.
-    type: The type of connection, always "sse".
-    headers: Optional headers to send with the connection request.
-    enabled_tools: Explicit allowlist of tools to enable. Mutually exclusive
-      with disabled_tools. When None, all tools from the server are enabled.
-      Only enabled tools are exposed to the model; others are hidden entirely
-      from the model's context, saving tokens.
-    disabled_tools: Explicit denylist of tools to disable. Mutually exclusive
-      with enabled_tools. When None, all tools from the server are enabled.
-      Disabled tools are removed from the model's context entirely, saving
-      tokens and preventing the model from even considering them.
-  """
-
-  url: str
-  type: Literal["sse"] = "sse"
-  headers: dict[str, str] | None = None
-  enabled_tools: list[str] | None = None
-  disabled_tools: list[str] | None = None
+  env: dict[str, str] | None = None
 
 
 class McpStreamableHttpServer(BaseMcpServerConfig):
@@ -458,14 +1006,6 @@ class McpStreamableHttpServer(BaseMcpServerConfig):
     timeout: Connection timeout in seconds.
     sse_read_timeout: SSE read timeout in seconds.
     terminate_on_close: Whether to terminate the connection on close.
-    enabled_tools: Explicit allowlist of tools to enable. Mutually exclusive
-      with disabled_tools. When None, all tools from the server are enabled.
-      Only enabled tools are exposed to the model; others are hidden entirely
-      from the model's context, saving tokens.
-    disabled_tools: Explicit denylist of tools to disable. Mutually exclusive
-      with enabled_tools. When None, all tools from the server are enabled.
-      Disabled tools are removed from the model's context entirely, saving
-      tokens and preventing the model from even considering them.
   """
 
   url: str
@@ -474,11 +1014,9 @@ class McpStreamableHttpServer(BaseMcpServerConfig):
   timeout: float = 30.0
   sse_read_timeout: float = 300.0
   terminate_on_close: bool = True
-  enabled_tools: list[str] | None = None
-  disabled_tools: list[str] | None = None
 
 
-McpServerConfig = McpStdioServer | McpSseServer | McpStreamableHttpServer
+McpServerConfig = McpStdioServer | McpStreamableHttpServer
 
 
 # =============================================================================
@@ -491,17 +1029,29 @@ class ToolCall(pydantic.BaseModel):
 
   Attributes:
     id: Optional unique identifier for the call, often assigned by the backend.
+    step_id: Optional identifier correlating this call with its step in the
+      trajectory.
     name: Tool identifier. Use a BuiltinTools member for Connection-provided
       tools, or an arbitrary string for custom host-side tools.
     args: Keyword arguments for the tool, as a JSON-serializable dict.
     canonical_path: Optional normalized filesystem path for file-related tools.
       Populated by the Connection layer to enable platform-agnostic L2 policies.
+    server_name: Optional server name if this tool belongs to an MCP server.
   """
 
   name: BuiltinTools | str
   args: dict[str, Any] = pydantic.Field(default_factory=dict)
   id: str | None = None
+  step_id: str | None = None
   canonical_path: str | None = None
+  server_name: str | None = None
+
+  @pydantic.model_validator(mode="after")
+  def _normalize_builtin_name(self) -> "ToolCall":
+    self.name = normalize_builtin_tool_name(
+        self.name, server_name=getattr(self, "server_name", None)
+    )
+    return self
 
 
 class ToolResult(pydantic.BaseModel):
@@ -509,11 +1059,13 @@ class ToolResult(pydantic.BaseModel):
 
   Attributes:
     id: Optional identifier correlating this result with a ToolCall.id.
+    step_id: Optional step identifier correlating this result with a step.
     name: The name of the tool that was executed. A BuiltinTools member for
       Connection-provided tools, or a string for custom host-side tools.
     result: The tool's return value. Can be any JSON-serializable value.
     error: An error message if execution failed, or None on success.
     exception: The original exception if execution failed. Not serialized.
+    server_name: Optional server name if this tool belongs to an MCP server.
   """
 
   model_config = pydantic.ConfigDict(
@@ -522,9 +1074,18 @@ class ToolResult(pydantic.BaseModel):
 
   name: BuiltinTools | str
   id: str | None = None
+  step_id: str | None = None
   result: Any = None
   error: str | None = None
   exception: Exception | None = pydantic.Field(default=None, exclude=True)
+  server_name: str | None = None
+
+  @pydantic.model_validator(mode="after")
+  def _normalize_builtin_name(self) -> "ToolResult":
+    self.name = normalize_builtin_tool_name(
+        self.name, server_name=getattr(self, "server_name", None)
+    )
+    return self
 
 
 PythonTool = Callable[..., Any]
@@ -533,6 +1094,20 @@ PythonTool = Callable[..., Any]
 # =============================================================================
 # Step types
 # =============================================================================
+
+
+class SandboxStatus(pydantic.BaseModel):
+  """OS command sandbox (exebox) status reported by the harness.
+
+  Attributes:
+    available: Whether the sandbox actually enforces isolation. When False,
+      run_command executes unsandboxed even if enable_sandbox was requested.
+    unavailable_reason: Human-readable explanation when available is False; None
+      when the sandbox is available.
+  """
+
+  available: bool
+  unavailable_reason: str | None = None
 
 
 class UsageMetadata(pydantic.BaseModel):
@@ -550,6 +1125,7 @@ class UsageMetadata(pydantic.BaseModel):
       (excluding thinking).
     thoughts_token_count: Number of tokens used for thinking/reasoning.
     total_token_count: Sum of prompt + candidates + thinking tokens.
+    service_tier: Service tier used for inference (e.g. "priority").
   """
 
   # Input tokens.
@@ -563,6 +1139,137 @@ class UsageMetadata(pydantic.BaseModel):
   # Total tokens (prompt + candidates + thoughts).
   total_token_count: int | None = None
 
+  # Service tier.
+  service_tier: ServiceTier | None = None
+
+  def __add__(self, other: Any) -> UsageMetadata:
+    """Adds token counts from another UsageMetadata or returns a copy for 0."""
+    if (
+        isinstance(other, (int, float))
+        and not isinstance(other, bool)
+        and other == 0
+    ):
+      return self.model_copy()
+    if not isinstance(other, UsageMetadata):
+      return NotImplemented
+    if self.service_tier == other.service_tier:
+      merged_tier = self.service_tier
+    elif self.service_tier is None or other.service_tier is None:
+      merged_tier = self.service_tier or other.service_tier
+    else:
+      # When combining different service tiers, default to STANDARD.
+      merged_tier = ServiceTier.STANDARD
+    return self.__class__(
+        prompt_token_count=(self.prompt_token_count or 0)
+        + (other.prompt_token_count or 0),
+        cached_content_token_count=(self.cached_content_token_count or 0)
+        + (other.cached_content_token_count or 0),
+        candidates_token_count=(self.candidates_token_count or 0)
+        + (other.candidates_token_count or 0),
+        thoughts_token_count=(self.thoughts_token_count or 0)
+        + (other.thoughts_token_count or 0),
+        total_token_count=(self.total_token_count or 0)
+        + (other.total_token_count or 0),
+        service_tier=merged_tier,
+    )
+
+  def __radd__(self, other: Any) -> UsageMetadata:
+    """Supports reflected addition for sum() accumulators and 0 identity."""
+    if (
+        isinstance(other, (int, float))
+        and not isinstance(other, bool)
+        and other == 0
+    ):
+      return self.model_copy()
+    if isinstance(other, UsageMetadata):
+      return self.__add__(other)
+    return NotImplemented
+
+  def __sub__(self, other: Any) -> UsageMetadata:
+    """Subtracts token counts of another UsageMetadata or returns a copy for 0."""
+    if (
+        isinstance(other, (int, float))
+        and not isinstance(other, bool)
+        and other == 0
+    ):
+      return self.model_copy()
+    if not isinstance(other, UsageMetadata):
+      return NotImplemented
+    return self.__class__(
+        prompt_token_count=(self.prompt_token_count or 0)
+        - (other.prompt_token_count or 0),
+        cached_content_token_count=(self.cached_content_token_count or 0)
+        - (other.cached_content_token_count or 0),
+        candidates_token_count=(self.candidates_token_count or 0)
+        - (other.candidates_token_count or 0),
+        thoughts_token_count=(self.thoughts_token_count or 0)
+        - (other.thoughts_token_count or 0),
+        total_token_count=(self.total_token_count or 0)
+        - (other.total_token_count or 0),
+        service_tier=self.service_tier or other.service_tier,
+    )
+
+  def __rsub__(self, other: Any) -> UsageMetadata:
+    """Supports reflected subtraction for numeric 0 identity (0 - u)."""
+    if (
+        isinstance(other, (int, float))
+        and not isinstance(other, bool)
+        and other == 0
+    ):
+      return self.__class__(
+          prompt_token_count=-(self.prompt_token_count or 0),
+          cached_content_token_count=-(self.cached_content_token_count or 0),
+          candidates_token_count=-(self.candidates_token_count or 0),
+          thoughts_token_count=-(self.thoughts_token_count or 0),
+          total_token_count=-(self.total_token_count or 0),
+          service_tier=self.service_tier,
+      )
+    if isinstance(other, UsageMetadata):
+      return other.__sub__(self)
+    return NotImplemented
+
+  def __mul__(self, factor: Any) -> UsageMetadata:
+    """Scales token counts by a non-negative, finite numeric factor."""
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+      return NotImplemented
+    if not math.isfinite(factor) or factor < 0:
+      raise ValueError(
+          "Multiplication factor must be a finite, non-negative number, got"
+          f" {factor}"
+      )
+    return self.__class__(
+        prompt_token_count=(
+            round(self.prompt_token_count * factor)
+            if self.prompt_token_count is not None
+            else None
+        ),
+        cached_content_token_count=(
+            round(self.cached_content_token_count * factor)
+            if self.cached_content_token_count is not None
+            else None
+        ),
+        candidates_token_count=(
+            round(self.candidates_token_count * factor)
+            if self.candidates_token_count is not None
+            else None
+        ),
+        thoughts_token_count=(
+            round(self.thoughts_token_count * factor)
+            if self.thoughts_token_count is not None
+            else None
+        ),
+        total_token_count=(
+            round(self.total_token_count * factor)
+            if self.total_token_count is not None
+            else None
+        ),
+        service_tier=self.service_tier,
+    )
+
+  def __rmul__(self, factor: Any) -> UsageMetadata:
+    """Reflected scalar multiplication delegating to __mul__."""
+    return self.__mul__(factor)
+
 
 class StepType(str, enum.Enum):
   """High-level type of a step."""
@@ -572,6 +1279,7 @@ class StepType(str, enum.Enum):
   SYSTEM_MESSAGE = "SYSTEM_MESSAGE"
   COMPACTION = "COMPACTION"
   FINISH = "FINISH"
+  THINKING = "THINKING"
   UNKNOWN = "UNKNOWN"
 
 
@@ -601,8 +1309,119 @@ class StepStatus(str, enum.Enum):
   WAITING_FOR_USER = "WAITING_FOR_USER"
   ERROR = "ERROR"
   CANCELED = "CANCELED"
-  TERMINAL_ERROR = "TERMINAL_ERROR"
   UNKNOWN = "UNKNOWN"
+
+
+class SessionContinuationMode(str, enum.Enum):
+  """Mode for establishing a connection to an agent session.
+
+  Attributes:
+    RESUME: Resume an existing session. Fail if it doesn't exist.
+    CREATE_OR_RESUME: Resume if exists, create a new one if missing.
+    CREATE_ONLY: Create a new session. Fail if it already exists.
+  """
+
+  RESUME = "resume"
+  CREATE_OR_RESUME = "create_or_resume"
+  CREATE_ONLY = "create_only"
+
+
+class BudgetScope(str, enum.Enum):
+  """Evaluation scope for budget limits and caps.
+
+  Attributes:
+    LIFETIME: Budget is evaluated against cumulative spend from the start of the
+      session (step 0).
+    FORWARD_LOOKING: Budget is evaluated against spend starting from when the
+      budget was configured or the session was resumed.
+  """
+
+  LIFETIME = "LIFETIME"
+  FORWARD_LOOKING = "FORWARD_LOOKING"
+
+
+class BudgetConfig(pydantic.BaseModel):
+  """Configuration for session-level budget limits and caps.
+
+  Attributes:
+    max_model_calls: Maximum number of model invocations (reasoning steps /
+      generator calls) permitted within the configured scope.
+    max_tool_calls: Maximum number of tool invocations permitted within the
+      configured scope, regardless of tool source.
+    max_input_tokens: Maximum net uncached input tokens permitted within the
+      configured scope (calculated as prompt tokens minus cached content tokens
+      across model turns).
+    max_output_tokens: Maximum output tokens permitted within the configured
+      scope (candidates + thoughts).
+    max_total_tokens: Maximum total net tokens permitted within the configured
+      scope (calculated as net uncached input tokens + output tokens
+      across model turns).
+    scope: The evaluation scope for this budget configuration. Defaults to
+      BudgetScope.LIFETIME.
+  """
+
+  max_model_calls: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT32
+  )
+  max_tool_calls: int | None = pydantic.Field(default=None, ge=1, le=_MAX_INT32)
+  max_input_tokens: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT64
+  )
+  max_output_tokens: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT64
+  )
+  max_total_tokens: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT64
+  )
+  scope: BudgetScope = BudgetScope.LIFETIME
+
+
+class StopReason(str, enum.Enum):
+  """Reason why the execution turn stopped.
+
+  Attributes:
+    UNSPECIFIED: Default value; normal completion or unspecified stop reason.
+    MAX_MODEL_CALLS_EXCEEDED: Turn halted because session exceeded configured
+      max_model_calls.
+    MAX_TOOL_CALLS_EXCEEDED: Turn halted because session exceeded
+      max_tool_calls.
+    MAX_INPUT_TOKENS_EXCEEDED: Turn halted because session exceeded
+      max_input_tokens.
+    MAX_OUTPUT_TOKENS_EXCEEDED: Turn halted because session exceeded
+      max_output_tokens.
+    MAX_TOTAL_TOKENS_EXCEEDED: Turn halted because session exceeded
+      max_total_tokens.
+    QUOTA_EXHAUSTED: Turn halted because backend model API quota was exhausted.
+  """
+
+  UNSPECIFIED = "UNSPECIFIED"
+  MAX_MODEL_CALLS_EXCEEDED = "MAX_MODEL_CALLS_EXCEEDED"
+  MAX_TOOL_CALLS_EXCEEDED = "MAX_TOOL_CALLS_EXCEEDED"
+  MAX_INPUT_TOKENS_EXCEEDED = "MAX_INPUT_TOKENS_EXCEEDED"
+  MAX_OUTPUT_TOKENS_EXCEEDED = "MAX_OUTPUT_TOKENS_EXCEEDED"
+  MAX_TOTAL_TOKENS_EXCEEDED = "MAX_TOTAL_TOKENS_EXCEEDED"
+  QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+
+
+@_beta_lib.beta
+class WorkflowProgress(pydantic.BaseModel):
+  """Progress and output metadata for a `run_workflow` step.
+
+  Attributes:
+    script_path: Path to the Python workflow script being executed (populated
+      when `run_workflow` is invoked with a `.py` script file path, including
+      via `await agent.beta.run_workflow(...)`).
+    script: Inline Python workflow script source (populated when the model
+      invokes `run_workflow` with inline script source during `agent.chat()`).
+    description: Brief description of the workflow run.
+    output: Formatted workflow log and result text produced by the workflow
+      script.
+  """
+
+  script_path: str = ""
+  script: str = ""
+  description: str = ""
+  output: str = ""
 
 
 class Step(pydantic.BaseModel):
@@ -611,6 +1430,10 @@ class Step(pydantic.BaseModel):
   Attributes:
     id: Unique string identifier for the step.
     step_index: Integer index of the step in the trajectory.
+    trajectory_id: Unique identifier of the trajectory owning this step.
+    parent_trajectory_id: ID of the parent trajectory that spawned this step, or
+      empty string for the root agent conversation.
+    depth: Nesting depth of this step (0 for root conversation).
     type: The high-level type of the step.
     source: The source that generated the step.
     target: The target interacting with this step.
@@ -626,12 +1449,18 @@ class Step(pydantic.BaseModel):
       steps per turn may have this flag set; consumers that want only the last
       response should iterate fully.
     structured_output: The structured output extracted from the finish step.
-    usage_metadata: Token usage for this specific step's model invocation, or
-      None if this step did not involve a model call.
+    workflow_progress: Workflow script metadata and formatted output when this
+      step is a `run_workflow` tool call.
+    usage_metadata: (Deprecated) Token usage for this specific step's model
+      invocation. Deprecated in favor of ChatResponse.usage_metadata (turn-level
+      usage) and agent.conversation.total_usage (session cumulative usage).
   """
 
   id: str = ""
   step_index: int = 0
+  trajectory_id: str = ""
+  parent_trajectory_id: str = ""
+  depth: int = 0
   type: StepType = StepType.UNKNOWN
   source: StepSource = StepSource.UNKNOWN
   target: StepTarget = StepTarget.UNKNOWN
@@ -644,7 +1473,17 @@ class Step(pydantic.BaseModel):
   error: str = ""
   is_complete_response: bool | None = None
   structured_output: Any | None = None
-  usage_metadata: UsageMetadata | None = None
+  workflow_progress: WorkflowProgress | None = None
+  usage_metadata: UsageMetadata | None = pydantic.Field(
+      default=None,
+      deprecated=(
+          "Step.usage_metadata is deprecated and will be removed in a future"
+          " release. Token usage is emitted per model invocation and does not"
+          " map 1:1 to individual execution steps. Use"
+          " ChatResponse.usage_metadata for turn-level usage or"
+          " agent.conversation.total_usage for cumulative session usage."
+      ),
+  )
 
   model_config = pydantic.ConfigDict(extra="allow")
 
@@ -658,12 +1497,16 @@ class HookResult(pydantic.BaseModel):
   Attributes:
     allow: Whether execution should proceed.
     message: Optional explanation or response message.
+    modified_args: Optional dictionary of modified tool arguments to
+      shallow-merge into the existing arguments dictionary (overwriting
+      specified keys) before execution.
   """
 
   model_config = pydantic.ConfigDict(extra="ignore")
 
   allow: bool = True
   message: str = ""
+  modified_args: dict[str, Any] | None = None
 
 
 class QuestionResponse(pydantic.BaseModel):
@@ -723,6 +1566,68 @@ class AskQuestionInteractionSpec(pydantic.BaseModel):
   questions: list[AskQuestionEntry]
 
 
+class StopDecision(str, enum.Enum):
+  """Decision returned by a Stop lifecycle hook.
+
+  Attributes:
+    ALLOW_STOP: Allows the turn execution to terminate and transition to
+      STATE_FULLY_IDLE.
+    CONTINUE: Blocks termination, injects reason as a system prompt, and resumes
+      the agent execution loop.
+  """
+
+  ALLOW_STOP = "ALLOW_STOP"
+  CONTINUE = "CONTINUE"
+
+
+class StopHookResult(pydantic.BaseModel):
+  """Result returned by a Stop lifecycle hook.
+
+  Attributes:
+    decision: Whether to allow the turn to stop or continue execution.
+    reason: The prompt/feedback injected into the conversation when decision is
+      CONTINUE. Must be non-empty when CONTINUE is selected; otherwise, raises a
+      ValueError. Delivered directly to the model as a system message.
+  """
+
+  model_config = pydantic.ConfigDict(extra="ignore")
+
+  decision: StopDecision = StopDecision.ALLOW_STOP
+  reason: str = ""
+
+  @pydantic.model_validator(mode="after")
+  def _validate_continue_reason(self) -> "StopHookResult":
+    if self.decision == StopDecision.CONTINUE and (
+        not self.reason or not self.reason.strip()
+    ):
+      raise ValueError(
+          "StopHookResult with decision=CONTINUE requires a non-empty reason."
+      )
+    return self
+
+
+class StopArgs(pydantic.BaseModel):
+  """Arguments delivered to a Stop hook when the root turn reaches idle.
+
+  Attributes:
+    response_text: Most recent assistant response text in the turn.
+    trajectory_id: Unique identifier of the trajectory executing this turn.
+    continuation_count: The 0-based iteration count of Stop hook continuations
+      within the current turn cycle.
+    stop_reason: The reason why the trajectory stopped (SDK StopReason enum
+      value).
+    error_message: Error message if execution stopped due to a fatal error.
+  """
+
+  model_config = pydantic.ConfigDict(extra="ignore")
+
+  response_text: str = ""
+  trajectory_id: str = ""
+  continuation_count: int = 0
+  stop_reason: StopReason = StopReason.UNSPECIFIED
+  error_message: str = ""
+
+
 # =============================================================================
 # Error types
 # =============================================================================
@@ -736,12 +1641,43 @@ class AntigravityConnectionError(Exception):
   """
 
 
+class AntigravityCancelledError(asyncio.CancelledError):
+  """Raised when an active turn is cancelled programmatically."""
+
+  def __init__(self, message: str = "The request was cancelled by the client."):
+    """Initializes the cancellation error with a default message."""
+    super().__init__(message)
+
+
 class AntigravityExecutionError(Exception):
   """Raised when the agent execution encounters a terminal error.
 
   This indicates that the agent loop has terminated due to a fatal error
   (e.g. model call failure, system constraint violation) and cannot continue.
   """
+
+
+class ToolExecutionError(RuntimeError):
+  """Raised when a tool execution fails, carrying tool metadata."""
+
+  tool_name: str
+  server_name: str | None
+  call_id: str | None
+  step_id: str | None
+
+  def __init__(
+      self,
+      message: str,
+      tool_name: str,
+      server_name: str | None = None,
+      call_id: str | None = None,
+      step_id: str | None = None,
+  ):
+    super().__init__(message)
+    self.tool_name = tool_name
+    self.server_name = server_name
+    self.call_id = call_id
+    self.step_id = step_id
 
 
 class AntigravityValidationError(Exception):
@@ -765,7 +1701,7 @@ class AntigravityValidationError(Exception):
     self.errors = errors or []
 
   @classmethod
-  def from_pydantic(
+  def _from_pydantic(
       cls, exc: pydantic.ValidationError
   ) -> "AntigravityValidationError":
     """Constructs from a Pydantic ValidationError.
@@ -776,38 +1712,7 @@ class AntigravityValidationError(Exception):
     Returns:
       An AntigravityValidationError wrapping the Pydantic error.
     """
-    return cls(message=str(exc), errors=exc.errors())
-
-
-class TriggerDelivery(str, enum.Enum):
-  """Controls how trigger messages are delivered to the agent."""
-
-  SEND_IMMEDIATELY = "send_immediately"  # Send immediately (non-blocking).
-  WAIT_IDLE = "wait_idle"  # Wait until agent is idle before sending.
-  # TODO: INTERRUPT — cancel current turn, then send. Deferred due to
-  # safety implications for in-flight tool calls (requires Connection.cancel()).
-
-
-class FileChangeKind(str, enum.Enum):
-  """Kind of filesystem change detected by a file-watching trigger."""
-
-  ADDED = "added"
-  MODIFIED = "modified"
-  DELETED = "deleted"
-
-
-class FileChange(pydantic.BaseModel):
-  """A single filesystem change detected by a file-watching trigger.
-
-  Attributes:
-    kind: The type of change (added, modified, deleted).
-    path: Absolute path to the changed file.
-  """
-
-  model_config = pydantic.ConfigDict(frozen=True)
-
-  kind: FileChangeKind
-  path: str
+    return cls(message=str(exc), errors=cast(Any, exc.errors()))
 
 
 # =============================================================================
@@ -896,13 +1801,14 @@ class ChatResponse:
               continue
             try:
               chunk = await self._chunk_stream.__anext__()
-              self._buffered_chunks.append(chunk)
             except StopAsyncIteration:
               self._is_done = True
-            except Exception as e:
+            except (asyncio.CancelledError, Exception) as e:
               self._is_done = True
               self._stream_error = e
               raise
+            else:
+              self._buffered_chunks.append(chunk)
 
     return _chunks_gen()
 
@@ -966,6 +1872,112 @@ class ChatResponse:
     """Accumulated token usage across all model invocations in this turn."""
     return self._conversation.last_turn_usage
 
+  @property
+  def stop_reason(self) -> StopReason:
+    """The reason why the execution turn stopped."""
+    return self._conversation._last_turn_stop_reason  # pylint: disable=protected-access
+
+  async def cancel(self) -> None:
+    """Cancels the active execution turn and halts generation.
+
+    This cleanly aborts the active stream on the backend. If the stream is
+    already completed, this method acts as a safe no-op.
+    """
+    if not self._is_done:
+      await self._conversation.cancel()
+
+
+async def _empty_chunk_stream() -> (
+    AsyncIterator[StreamChunk | ToolCall | ToolResult]
+):
+  if False:  # pylint: disable=using-constant-test
+    yield
+
+
+@_beta_lib.beta
+class WorkflowResult(ChatResponse):
+  """Final result returned by `await agent.beta.run_workflow(...)`.
+
+  Subclasses `ChatResponse` so all turn-level response accessors
+  (`await result.text()`, `await result.structured_output()`,
+  `await result.resolve()`, `result.chunks`, `result.thoughts`,
+  `result.tool_calls`, `result.usage_metadata`, `result.stop_reason`)
+  are available alongside workflow-specific attributes.
+
+  Attributes:
+    script_path: Path to the Python workflow script executed (when invoked with
+      a script file path).
+    script: Inline Python workflow script source (when invoked with inline
+      script source).
+    description: Brief description of the workflow run.
+    output: Formatted workflow log and result text produced by the workflow
+      script.
+    response_text: Final assistant response text from the workflow turn.
+  """
+
+  script_path: str
+  script: str
+  description: str
+  output: str
+  response_text: str
+
+  def __init__(
+      self,
+      chunk_stream: (
+          AsyncIterator[StreamChunk | ToolCall | ToolResult] | None
+      ) = None,
+      conversation: Any = None,
+      *,
+      script_path: str = "",
+      script: str = "",
+      description: str = "",
+      output: str = "",
+      response_text: str = "",
+  ):
+    super().__init__(
+        chunk_stream=(
+            chunk_stream if chunk_stream is not None else _empty_chunk_stream()
+        ),
+        conversation=conversation,
+    )
+    self.script_path = script_path
+    self.script = script
+    self.description = description
+    self.output = output
+    self.response_text = response_text
+    if chunk_stream is None:
+      self._buffered_chunks = (
+          [Text(step_index=0, text=response_text)] if response_text else []
+      )
+      self._is_done = True
+
+  @classmethod
+  def _from_chat_response(
+      cls,
+      chat_resp: ChatResponse,
+      *,
+      script_path: str = "",
+      script: str = "",
+      description: str = "",
+      output: str = "",
+      response_text: str = "",
+  ) -> "WorkflowResult":
+    """Constructs a `WorkflowResult` preserving `chat_resp` state."""
+    res = cls(
+        chunk_stream=getattr(chat_resp, "_chunk_stream", None),
+        conversation=getattr(chat_resp, "_conversation", None),
+        script_path=script_path,
+        script=script,
+        description=description,
+        output=output,
+        response_text=response_text,
+    )
+    if hasattr(chat_resp, "_buffered_chunks"):
+      res._buffered_chunks = list(chat_resp._buffered_chunks)  # pylint: disable=protected-access
+      res._is_done = getattr(chat_resp, "_is_done", True)  # pylint: disable=protected-access
+      res._stream_error = getattr(chat_resp, "_stream_error", None)  # pylint: disable=protected-access
+    return res
+
 
 # =============================================================================
 # Input Content Primitives
@@ -992,7 +2004,12 @@ SUPPORTED_DOCUMENT_MIMES = frozenset({
 
 SUPPORTED_AUDIO_MIMES = frozenset({
     "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/vnd.wave",
     "audio/mp3",
+    "audio/mp4",
+    "audio/webm",
     "audio/aac",
     "audio/ogg",
     "audio/flac",
@@ -1030,7 +2047,7 @@ def _read_file_safely(path: str | pathlib.Path) -> bytes:
       PermissionError: If the file is not readable.
       OSError: For other filesystem errors.
   """
-  file_path = pathlib.Path(path)
+  file_path = pathlib.Path(path).expanduser()
   try:
     return file_path.read_bytes()
   except FileNotFoundError as exc:
@@ -1047,17 +2064,57 @@ def _read_file_safely(path: str | pathlib.Path) -> bytes:
     raise OSError(f"Failed to read file at path '{file_path}': {exc}") from exc
 
 
+def _read_file_and_guess_mime(
+    path: str | pathlib.Path,
+) -> tuple[bytes, str]:
+  """Reads a file and guesses its MIME type.
+
+  Args:
+      path: The file path to read.
+
+  Returns:
+      A tuple containing the file contents as bytes and the guessed MIME type
+      as a string.
+
+  Raises:
+      ValueError: If the MIME type cannot be guessed.
+  """
+  file_path = pathlib.Path(path).expanduser()
+  data = _read_file_safely(file_path)
+  mime_guess, _ = mimetypes.guess_type(file_path)
+  if not mime_guess:
+    raise ValueError(
+        f"Could not infer a valid MIME type for extension: '{file_path.suffix}'"
+    )
+  return data, mime_guess
+
+
 class _BaseMedia(pydantic.BaseModel):
   """Base class for all rich multimedia content attachment primitives."""
+
+  _SUPPORTED_MIMES: ClassVar[frozenset[str]] = frozenset()
 
   data: bytes
   mime_type: str
   description: str | None = None
 
+  @pydantic.field_validator("mime_type")
+  @classmethod
+  def _validate_mime_type(cls, v: str) -> str:
+    """Validates that the MIME type is supported for this media type."""
+    normalized = v.strip().lower()
+    if cls is _BaseMedia:
+      return normalized
+    if normalized not in cls._SUPPORTED_MIMES:
+      raise ValueError(f"Unsupported {cls.__name__} MIME type: '{v}'")
+    return normalized
+
   @classmethod
   def from_file(
-      cls, path: str | pathlib.Path, description: str | None = None
-  ) -> _BaseMedia:
+      cls: type[_BaseMediaT],
+      path: str | pathlib.Path,
+      description: str | None = None,
+  ) -> _BaseMediaT:
     """Instantiates a media content primitive from a local file path.
 
     Args:
@@ -1067,12 +2124,10 @@ class _BaseMedia(pydantic.BaseModel):
     Returns:
         The instantiated media object.
     """
-    file_path = pathlib.Path(path)
-    data = _read_file_safely(file_path)
-    mime_guess, _ = mimetypes.guess_type(file_path)
+    data, mime_type = _read_file_and_guess_mime(path)
     return cls(
         data=data,
-        mime_type=mime_guess or "",
+        mime_type=mime_type,
         description=description,
     )
 
@@ -1082,53 +2137,52 @@ class _BaseMedia(pydantic.BaseModel):
 class Image(_BaseMedia):
   """Image content attachment primitive."""
 
-  @pydantic.field_validator("mime_type")
-  @classmethod
-  def validate_mime_type(cls, v: str) -> str:
-    """Validates that the MIME type is supported for Image content."""
-    if v not in SUPPORTED_IMAGE_MIMES:
-      raise ValueError(f"Unsupported Image MIME type: '{v}'")
-    return v
+  _SUPPORTED_MIMES: ClassVar[frozenset[str]] = SUPPORTED_IMAGE_MIMES
 
 
 class Document(_BaseMedia):
   """Document content attachment primitive."""
 
-  @pydantic.field_validator("mime_type")
-  @classmethod
-  def validate_mime_type(cls, v: str) -> str:
-    """Validates that the MIME type is supported for Document content."""
-    if v not in SUPPORTED_DOCUMENT_MIMES:
-      raise ValueError(f"Unsupported Document MIME type: '{v}'")
-    return v
+  _SUPPORTED_MIMES: ClassVar[frozenset[str]] = SUPPORTED_DOCUMENT_MIMES
 
 
 class Audio(_BaseMedia):
   """Audio content attachment primitive."""
 
-  @pydantic.field_validator("mime_type")
-  @classmethod
-  def validate_mime_type(cls, v: str) -> str:
-    """Validates that the MIME type is supported for Audio content."""
-    if v not in SUPPORTED_AUDIO_MIMES:
-      raise ValueError(f"Unsupported Audio MIME type: '{v}'")
-    return v
+  _SUPPORTED_MIMES: ClassVar[frozenset[str]] = SUPPORTED_AUDIO_MIMES
 
 
 class Video(_BaseMedia):
   """Video content attachment primitive."""
 
-  @pydantic.field_validator("mime_type")
-  @classmethod
-  def validate_mime_type(cls, v: str) -> str:
-    """Validates that the MIME type is supported for Video content."""
-    if v not in SUPPORTED_VIDEO_MIMES:
-      raise ValueError(f"Unsupported Video MIME type: '{v}'")
-    return v
+  _SUPPORTED_MIMES: ClassVar[frozenset[str]] = SUPPORTED_VIDEO_MIMES
 
 
-ContentPrimitive = str | Image | Document | Audio | Video
-Content = ContentPrimitive | list[ContentPrimitive]
+class BuiltinSlashCommandName(str, enum.Enum):
+  """Supported system slash commands.
+
+  Attributes:
+    PLAN: Plan carefully before executing a task (generates an implementation
+      plan artifact and awaits user approval).
+  """
+
+  PLAN = "plan"
+
+
+class SlashCommand(pydantic.BaseModel):
+  """Slash command context primitive.
+
+  Attributes:
+    name: The strict BuiltinSlashCommandName enum.
+  """
+
+  model_config = pydantic.ConfigDict(frozen=True)
+
+  name: BuiltinSlashCommandName
+
+
+ContentPrimitive = str | Image | Document | Audio | Video | SlashCommand
+Content = ContentPrimitive | Sequence[ContentPrimitive]
 
 # Registry mapping each supported MIME type to its media class.
 # Built once at import time from the per-category frozensets.
@@ -1160,19 +2214,35 @@ def from_file(
   Raises:
       ValueError: If the MIME type cannot be inferred or is unsupported.
   """
-  file_path = pathlib.Path(path)
-  data = _read_file_safely(file_path)
+  data, mime_type = _read_file_and_guess_mime(path)
+  return from_bytes(data, mime_type, description)
 
-  mime_guess, _ = mimetypes.guess_type(file_path)
-  if not mime_guess:
-    raise ValueError(
-        f"Could not infer a valid MIME type for extension: '{file_path.suffix}'"
-    )
 
-  media_cls = _MIME_TO_MEDIA_CLASS.get(mime_guess)
+def from_bytes(
+    data: bytes, mime_type: str, description: str | None = None
+) -> Image | Document | Audio | Video:
+  """Automatically resolves raw bytes and a MIME type into the correct Content primitive.
+
+  Args:
+      data: Raw file bytes.
+      mime_type: The MIME type of the content.
+      description: Optional text description of the media.
+
+  Returns:
+      A specialized media object (Image, Document, Audio, or Video) based on the
+      MIME type.
+
+  Raises:
+      ValueError: If the MIME type is unsupported.
+  """
+  normalized_mime = mime_type.strip().lower()
+  media_cls = _MIME_TO_MEDIA_CLASS.get(normalized_mime)
   if media_cls is None:
     raise ValueError(
-        f"Unsupported MIME type: '{mime_guess}'. "
+        f"Unsupported MIME type: '{mime_type}'. "
         f"Supported file formats in the SDK are: {sorted(_MIME_TO_MEDIA_CLASS)}"
     )
-  return media_cls(data=data, mime_type=mime_guess, description=description)  # pytype: disable=bad-return-type
+  return cast(
+      Image | Document | Audio | Video,
+      media_cls(data=data, mime_type=normalized_mime, description=description),
+  )

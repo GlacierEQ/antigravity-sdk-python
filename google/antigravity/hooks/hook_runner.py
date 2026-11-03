@@ -14,6 +14,7 @@
 
 """Manages registration and execution of Antigravity SDK hooks."""
 
+from collections.abc import Sequence
 import logging
 from typing import Any
 
@@ -34,6 +35,9 @@ _HOOK_TYPE_REGISTRY: list[tuple[type, str]] = [
     (hooks_base.OnToolErrorHook, '_on_tool_error_hooks'),
     (hooks_base.OnInteractionHook, '_on_interaction_hooks'),
     (hooks_base.OnCompactionHook, '_on_compaction_hooks'),
+    (hooks_base.StopHook, '_stop_hooks'),
+    (hooks_base._PreStepHook, '_pre_step_hooks_list'),  # pylint: disable=protected-access
+    (hooks_base._PostStepHook, '_post_step_hooks_list'),  # pylint: disable=protected-access
 ]
 
 
@@ -42,6 +46,8 @@ class HookRunner:
 
   def __init__(
       self,
+      hooks: Sequence[Any] | None = None,
+      *,
       on_session_start_hooks: list[hooks_base.OnSessionStartHook] | None = None,
       on_session_end_hooks: list[hooks_base.OnSessionEndHook] | None = None,
       pre_turn_hooks: list[hooks_base.PreTurnHook] | None = None,
@@ -53,6 +59,9 @@ class HookRunner:
       on_tool_error_hooks: list[hooks_base.OnToolErrorHook] | None = None,
       on_interaction_hooks: list[hooks_base.OnInteractionHook] | None = None,
       on_compaction_hooks: list[hooks_base.OnCompactionHook] | None = None,
+      stop_hooks: list[hooks_base.StopHook] | None = None,
+      _pre_step_hooks: list[hooks_base._PreStepHook] | None = None,  # pylint: disable=invalid-name,protected-access
+      _post_step_hooks: list[hooks_base._PostStepHook] | None = None,  # pylint: disable=invalid-name,protected-access
   ):
     self._on_session_start_hooks = on_session_start_hooks or []
     self._on_session_end_hooks = on_session_end_hooks or []
@@ -63,8 +72,15 @@ class HookRunner:
     self._on_tool_error_hooks = on_tool_error_hooks or []
     self._on_interaction_hooks = on_interaction_hooks or []
     self._on_compaction_hooks = on_compaction_hooks or []
+    self._stop_hooks = stop_hooks or []
+    self._pre_step_hooks_list = _pre_step_hooks or []
+    self._post_step_hooks_list = _post_step_hooks or []
 
     self.session_context = hooks_base.SessionContext()
+
+    if hooks:
+      for hook in hooks:
+        self.register_hook(hook)
 
   @property
   def has_hooks(self) -> bool:
@@ -79,6 +95,9 @@ class HookRunner:
         self._on_tool_error_hooks,
         self._on_interaction_hooks,
         self._on_compaction_hooks,
+        self._stop_hooks,
+        self._pre_step_hooks_list,
+        self._post_step_hooks_list,
     ))
 
   @property
@@ -119,7 +138,19 @@ class HookRunner:
   def on_compaction_hooks(self) -> tuple[hooks_base.OnCompactionHook, ...]:
     return tuple(self._on_compaction_hooks)
 
-  def register_hook(self, hook: Any):
+  @property
+  def stop_hooks(self) -> tuple[hooks_base.StopHook, ...]:
+    return tuple(self._stop_hooks)
+
+  @property
+  def _pre_step_hooks(self) -> tuple[hooks_base._PreStepHook, ...]:
+    return tuple(self._pre_step_hooks_list)
+
+  @property
+  def _post_step_hooks(self) -> tuple[hooks_base._PostStepHook, ...]:
+    return tuple(self._post_step_hooks_list)
+
+  def register_hook(self, hook: Any) -> None:
     """Registers a hook by inferring its type.
 
     Args:
@@ -128,11 +159,13 @@ class HookRunner:
     Raises:
       ValueError: If the hook type is unknown.
     """
+    registered = False
     for hook_type, attr_name in _HOOK_TYPE_REGISTRY:
       if isinstance(hook, hook_type):
         getattr(self, attr_name).append(hook)
-        return
-    raise ValueError(f'Unknown hook type: {type(hook)}')
+        registered = True
+    if not registered:
+      raise ValueError(f'Unknown hook type: {type(hook)}')
 
   # Session
   async def dispatch_session_start(self) -> None:
@@ -195,13 +228,30 @@ class HookRunner:
       A tuple of (HookResult, ToolCall, OperationContext).
     """
     op_context = hooks_base.OperationContext(turn_context)
+    current_tool_call = tool_call
+    last_allow_result = hooks_base.HookResult(allow=True)
+    had_modifications = False
 
     for hook in self._pre_tool_call_decide_hooks:
-      res = await hook.run(context=op_context, data=tool_call)
+      res = await hook.run(context=op_context, data=current_tool_call)
       if not res.allow:
-        return res, tool_call, op_context
+        return res, current_tool_call, op_context
 
-    return hooks_base.HookResult(allow=True), tool_call, op_context
+      last_allow_result = res
+      if res.modified_args is not None:
+        merged_args = dict(current_tool_call.args)
+        merged_args.update(res.modified_args)
+        current_tool_call = current_tool_call.model_copy(
+            update={'args': merged_args}
+        )
+        had_modifications = True
+
+    if had_modifications:
+      last_allow_result = last_allow_result.model_copy(
+          update={'modified_args': dict(current_tool_call.args)}
+      )
+
+    return last_allow_result, current_tool_call, op_context
 
   async def dispatch_post_tool_call(
       self, op_context: hooks_base.OperationContext, result: Any
@@ -270,7 +320,7 @@ class HookRunner:
 
   # Compaction
   async def dispatch_compaction(
-      self, turn_context: hooks_base.TurnContext, data: Any
+      self, turn_context: hooks_base.TurnContext, data: types.Step
   ) -> None:
     """Dispatches compaction events.
 
@@ -281,3 +331,42 @@ class HookRunner:
     op_context = hooks_base.OperationContext(turn_context)
     for hook in self._on_compaction_hooks:
       await hook.run(context=op_context, data=data)
+
+  async def dispatch_stop(
+      self,
+      turn_context: hooks_base.TurnContext,
+      args: types.StopArgs,
+  ) -> types.StopHookResult:
+    """Dispatches stop hook events.
+
+    Iterates stop hooks sequentially and short-circuits on the first
+    `StopDecision.CONTINUE` decision with a non-empty reason.
+
+    Args:
+      turn_context: The current turn context.
+      args: The stop arguments containing response text, trajectory ID,
+        continuation count, stop reason, and error message.
+
+    Returns:
+      A StopHookResult with the decision and optional reason.
+    """
+    for hook in self._stop_hooks:
+      res = await hook.run(context=turn_context, data=args)
+      if res is not None and res.decision == types.StopDecision.CONTINUE:
+        return res
+    return types.StopHookResult(decision=types.StopDecision.ALLOW_STOP)
+
+  # Telemetry Internal Step Hooks
+  async def dispatch_pre_step(
+      self, turn_context: hooks_base.TurnContext, step: types.Step
+  ) -> None:
+    """Dispatches internal pre-step observability events."""
+    for hook in self._pre_step_hooks:
+      await hook.run(context=turn_context, data=step)
+
+  async def dispatch_post_step(
+      self, turn_context: hooks_base.TurnContext, step: types.Step
+  ) -> None:
+    """Dispatches internal post-step observability events."""
+    for hook in self._post_step_hooks:
+      await hook.run(context=turn_context, data=step)

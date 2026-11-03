@@ -14,110 +14,51 @@
 
 """Tests for tool_context module."""
 
-import asyncio
+import concurrent.futures
+import threading
+import time
+from typing import Any
 from unittest import mock
 
 from absl.testing import absltest
 
-from google.antigravity.connections import connection as connection_module
+from google.antigravity.conversation import conversation as conversation_module
 from google.antigravity.tools import tool_context
 
 
-def _make_mock_connection(**overrides) -> mock.MagicMock:
-  """Creates a mock Connection with sensible defaults.
+def _make_mock_conversation(**overrides) -> mock.MagicMock:
+  """Creates a mock Conversation with sensible defaults.
 
   Args:
     **overrides: Attribute overrides for the mock.
 
   Returns:
-    A MagicMock with spec=Connection.
+    A MagicMock with spec=Conversation.
   """
-  conn = mock.MagicMock(spec=connection_module.Connection)
-  conn.conversation_id = "test-conv-123"
-  conn.is_idle = True
-  conn.send_trigger_notification = mock.AsyncMock()
+  conv = mock.MagicMock(spec=conversation_module.Conversation)
+  conv.conversation_id = "test-conv-123"
   for k, v in overrides.items():
-    setattr(conn, k, v)
-  return conn
+    setattr(conv, k, v)
+  return conv
 
 
 class ToolContextPropertyTest(absltest.TestCase):
   """Validates ToolContext property accessors.
 
-  Ensures that conversation_id and is_idle delegate correctly to
-  the underlying Connection.
+  Ensures that conversation_id delegates correctly to
+  the underlying Conversation.
   """
 
   def test_conversation_id(self):
-    """Verifies conversation_id delegates to Connection.conversation_id.
+    """Verifies conversation_id delegates to Conversation.conversation_id.
 
-    What: Checks that the property returns the connection's ID.
+    What: Checks that the property returns the conversation's ID.
     Why: ToolContext must expose identity for tool-level state management.
-    How: Creates a ToolContext with a mock connection and asserts equality.
+    How: Creates a ToolContext with a mock conversation and asserts equality.
     """
-    conn = _make_mock_connection(conversation_id="abc-123")
-    ctx = tool_context.ToolContext(conn)
+    conv = _make_mock_conversation(conversation_id="abc-123")
+    ctx = tool_context.ToolContext(conv)
     self.assertEqual(ctx.conversation_id, "abc-123")
-
-  def test_is_idle_true(self):
-    """Verifies is_idle returns True when the connection is idle.
-
-    What: Checks the idle property delegation.
-    Why: Tools need idle state to decide whether to send follow-up messages.
-    How: Creates a ToolContext with an idle connection and asserts True.
-    """
-    conn = _make_mock_connection(is_idle=True)
-    ctx = tool_context.ToolContext(conn)
-    self.assertTrue(ctx.is_idle)
-
-  def test_is_idle_false(self):
-    """Verifies is_idle returns False when the connection is not idle.
-
-    What: Checks the non-idle case.
-    Why: Validates both branches of the boolean delegation.
-    How: Creates a ToolContext with a non-idle connection and asserts False.
-    """
-    conn = _make_mock_connection(is_idle=False)
-    ctx = tool_context.ToolContext(conn)
-    self.assertFalse(ctx.is_idle)
-
-
-class ToolContextSendTest(absltest.TestCase):
-  """Validates ToolContext.send() delegation.
-
-  Ensures that send() dispatches to Connection.send_trigger_notification().
-  """
-
-  def test_send_delegates_to_connection(self):
-    """Verifies send() calls send_trigger_notification on the connection.
-
-    What: Checks that send() dispatches the message correctly.
-    Why: send() is the primary tool-to-agent communication channel.
-    How: Calls send() and asserts the connection received the message.
-    """
-    conn = _make_mock_connection()
-    ctx = tool_context.ToolContext(conn)
-    asyncio.run(ctx.send("hello agent"))
-    conn.send_trigger_notification.assert_awaited_once_with("hello agent")
-
-  def test_send_multiple_messages(self):
-    """Verifies multiple send() calls dispatch independently.
-
-    What: Checks that each send() creates a separate notification.
-    Why: Tools may need to send multiple messages during execution.
-    How: Calls send() twice and asserts both calls were dispatched.
-    """
-    conn = _make_mock_connection()
-    ctx = tool_context.ToolContext(conn)
-
-    async def _send_two():
-      await ctx.send("first")
-      await ctx.send("second")
-
-    asyncio.run(_send_two())
-    self.assertEqual(conn.send_trigger_notification.await_count, 2)
-    conn.send_trigger_notification.assert_any_await("first")
-    conn.send_trigger_notification.assert_any_await("second")
 
 
 class ToolContextStateTest(absltest.TestCase):
@@ -134,8 +75,8 @@ class ToolContextStateTest(absltest.TestCase):
     Why: Tools should not crash when accessing unset state.
     How: Calls get_state for an absent key and asserts the default.
     """
-    conn = _make_mock_connection()
-    ctx = tool_context.ToolContext(conn)
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
     self.assertIsNone(ctx.get_state("missing"))
     self.assertEqual(ctx.get_state("missing", "fallback"), "fallback")
 
@@ -146,8 +87,8 @@ class ToolContextStateTest(absltest.TestCase):
     Why: Core state store functionality must work correctly.
     How: Sets a value and asserts it's returned by get_state.
     """
-    conn = _make_mock_connection()
-    ctx = tool_context.ToolContext(conn)
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
     ctx.set_state("counter", 42)
     self.assertEqual(ctx.get_state("counter"), 42)
 
@@ -158,8 +99,8 @@ class ToolContextStateTest(absltest.TestCase):
     Why: State must be mutable for accumulating tool results.
     How: Sets a key twice and asserts the latest value is returned.
     """
-    conn = _make_mock_connection()
-    ctx = tool_context.ToolContext(conn)
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
     ctx.set_state("key", "old")
     ctx.set_state("key", "new")
     self.assertEqual(ctx.get_state("key"), "new")
@@ -172,11 +113,153 @@ class ToolContextStateTest(absltest.TestCase):
     How: Creates two contexts, sets state on one, and asserts the other
     does not see it.
     """
-    conn = _make_mock_connection()
-    ctx1 = tool_context.ToolContext(conn)
-    ctx2 = tool_context.ToolContext(conn)
+    conv = _make_mock_conversation()
+    ctx1 = tool_context.ToolContext(conv)
+    ctx2 = tool_context.ToolContext(conv)
     ctx1.set_state("shared_key", "value1")
     self.assertIsNone(ctx2.get_state("shared_key"))
+
+  def test_update_state(self):
+    """Verifies update_state applies the updater function and returns new value.
+
+    What: Checks that update_state updates existing or default values correctly.
+    Why: Tools need a reliable way to transform state in a single call.
+    How: Calls update_state on a new key with default=0 and updater x + 10, then
+    again with x * 2, asserting the return values and stored values.
+    """
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
+    val1 = ctx.update_state("score", lambda x: x + 10, default=0)
+    self.assertEqual(val1, 10)
+    self.assertEqual(ctx.get_state("score"), 10)
+
+    val2 = ctx.update_state("score", lambda x: x * 2)
+    self.assertEqual(val2, 20)
+    self.assertEqual(ctx.get_state("score"), 20)
+
+  def test_update_state_exception_safety(self):
+    """Verifies exception propagation and lock rollback inside update_state.
+
+    What: Checks that when updater_fn raises an exception, state remains
+    unmodified and the lock is cleanly released.
+    Why: Exception safety guarantees that partial or failed state mutations do
+    not corrupt state or deadlock future accesses.
+    How: Calls update_state with a callback raising ValueError, asserts
+    propagation, asserts state untouched, and asserts lock can be re-acquired.
+    """
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
+    ctx.set_state("key", "initial")
+
+    def _raising_updater(val: Any) -> Any:
+      del val
+      raise ValueError("updater failed")
+
+    with self.assertRaises(ValueError):
+      ctx.update_state("key", _raising_updater)
+
+    self.assertEqual(ctx.get_state("key"), "initial")
+    with ctx.lock():  # Asserts lock was released and is acquirable
+      self.assertEqual(ctx.get_state("key"), "initial")
+
+  def test_lock_and_context_manager(self):
+    """Verifies lock() and context manager (__enter__/__exit__) support.
+
+    What: Checks lock() returns an RLock and ToolContext is a context manager.
+    Why: Tools with multi-step critical sections need explicit lock acquisition.
+    How: Acquires locks via with ctx.lock(): and with ctx: in nested fashion.
+    Also verifies mutual exclusion across concurrent worker threads.
+    """
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
+    self.assertTrue(hasattr(ctx.lock(), "acquire"))
+    self.assertTrue(hasattr(ctx.lock(), "release"))
+    with ctx.lock():
+      ctx.set_state("in_lock", True)
+      with ctx:  # Reentrant check
+        self.assertTrue(ctx.get_state("in_lock"))
+
+    barrier = threading.Barrier(2)
+    acquired_order = []
+
+    def _t1() -> None:
+      with ctx:
+        barrier.wait()
+        time.sleep(0.01)
+        acquired_order.append(1)
+
+    def _t2() -> None:
+      barrier.wait()
+      with ctx:
+        acquired_order.append(2)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+      f1 = pool.submit(_t1)
+      f2 = pool.submit(_t2)
+      f1.result()
+      f2.result()
+
+    self.assertEqual(acquired_order, [1, 2])
+
+  def test_concurrent_set_state_thread_safety(self):
+    """Verifies thread safety of set_state across concurrent worker threads.
+
+    What: Checks that concurrent set_state calls across threads do not corrupt
+    the state dictionary or lose independent key writes.
+    Why: When synchronous tools run on thread pools, dict operations must be
+    synchronized to avoid race conditions or dictionary corruption.
+    How: Uses ThreadPoolExecutor and a Barrier across 25 threads to write to
+    both shared and distinct keys simultaneously, verifying all writes succeed.
+    """
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
+    num_threads = 25
+    barrier = threading.Barrier(num_threads)
+
+    def _worker(thread_id: int) -> None:
+      barrier.wait()
+      ctx.set_state(f"key_{thread_id}", thread_id)
+      ctx.set_state("shared_latest", thread_id)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+      futures = [pool.submit(_worker, i) for i in range(num_threads)]
+      for future in futures:
+        future.result()
+
+    for i in range(num_threads):
+      self.assertEqual(ctx.get_state(f"key_{i}"), i)
+    self.assertIn(ctx.get_state("shared_latest"), range(num_threads))
+
+  def test_atomic_update_state_concurrent_threads(self):
+    """Verifies update_state prevents lost updates under concurrent contention.
+
+    What: Checks that update_state guarantees atomic read-modify-write
+    operations across threads.
+    Why: Without atomicity, compound updates (like increments) racing across
+    asyncio.to_thread / ThreadPoolExecutor lose updates.
+    How: Uses ThreadPoolExecutor and a Barrier across 25 threads where each
+    thread increments a shared counter via update_state simultaneously. Asserts
+    that counter equals exactly 25.
+    """
+    conv = _make_mock_conversation()
+    ctx = tool_context.ToolContext(conv)
+    num_threads = 25
+    barrier = threading.Barrier(num_threads)
+
+    def _slow_increment(val: Any) -> int:
+      time.sleep(0.0001)
+      return int(val) + 1
+
+    def _increment_worker() -> None:
+      barrier.wait()
+      ctx.update_state("counter", _slow_increment, default=0)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+      futures = [pool.submit(_increment_worker) for _ in range(num_threads)]
+      for future in futures:
+        future.result()
+
+    self.assertEqual(ctx.get_state("counter"), num_threads)
 
 
 if __name__ == "__main__":

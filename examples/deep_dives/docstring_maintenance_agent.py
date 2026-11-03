@@ -19,11 +19,12 @@ import asyncio
 import logging
 import os
 import sys
+from google.antigravity import Agent
+from google.antigravity import LocalAgentConfig
 from google.antigravity import types
-from google.antigravity import Agent, LocalAgentConfig
-
+from google.antigravity.hooks import HookContext
 from google.antigravity.hooks import policy
-from google.antigravity.hooks import HookContext, PreToolCallDecideHook
+from google.antigravity.hooks import PreToolCallDecideHook
 
 _TOOL_NAME_MAPPING = {
     types.BuiltinTools.VIEW_FILE.value: "Viewing Files",
@@ -134,7 +135,7 @@ async def main():
           types.BuiltinTools.CREATE_FILE,
           types.BuiltinTools.RUN_COMMAND,
           types.BuiltinTools.ASK_QUESTION,
-          types.BuiltinTools.START_SUBAGENT,
+          types.BuiltinTools.INVOKE_SUBAGENT,
           types.BuiltinTools.GENERATE_IMAGE,
           types.BuiltinTools.FINISH,
       ]

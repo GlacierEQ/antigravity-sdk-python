@@ -30,6 +30,16 @@ backend. - **Responsibilities**: Sends prompts and receives execution steps. It
 decouples higher-level APIs from specific transport details or backend locations
 (local, cloud, etc.).
 
+The SDK ships multiple `ConnectionStrategy` implementations for different
+backends:
+
+-   `LocalConnectionStrategy`: Connects to the remote Gemini API.
+-   `LiteRTConnectionStrategy`: Runs models locally on-device using LiteRT-LM.
+-   `LocalOpenAIConnectionStrategy`: Connects to any OpenAI-compatible local
+    server (Ollama, LM Studio, etc.).
+
+For details on local model configuration, see `references/local_models.md`.
+
 ## Relationship and Flow
 
 The core concepts work together in a hierarchical fashion to manage an
@@ -51,3 +61,17 @@ interaction:
 This structure allows the user to interact with a simple, high-level `Agent`
 interface while the `Conversation` and `Connection` handle the state management
 and transport details under the hood.
+
+## Beta Namespaces (`google.antigravity.beta` & `Agent.beta`)
+
+Experimental features are isolated under beta namespaces and are subject to
+change:
+
+-   **Module-level exports**: Import experimental classes, configurations, and
+    functions from `google.antigravity.beta` (e.g.,
+    `from google.antigravity.beta import NewClass` or
+    `from google.antigravity import beta`).
+-   **Owned methods**: Experimental methods and properties on `Agent` (or other
+    core SDK classes) are accessed via the `.beta` namespace attribute (e.g.,
+    `await agent.beta.new_method(...)` on an instance, or
+    `Agent.beta.new_method(...)` on the class).

@@ -48,7 +48,8 @@ Criteria for correct script performance:
 
 import asyncio
 import pydantic
-from google.antigravity import Agent, LocalAgentConfig
+from google.antigravity import Agent
+from google.antigravity import LocalAgentConfig
 
 
 class ActionItem(pydantic.BaseModel):
