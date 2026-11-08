@@ -1,0 +1,46 @@
+name: Google Antigravity Python SDK CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Byte-compile verification
+        run: |
+          python -m compileall -q google
+
+      - name: Run unit test suite
+        run: |
+          pytest -v google/antigravity/agent_test.py
+          pytest -v google/antigravity/types_test.py
+          pytest -v google/antigravity/workflows_test.py
+          pytest -v google/antigravity/connections/local/litert_connection_test.py
+          pytest -v google/antigravity/tools/
+          pytest -v google/antigravity/triggers/
+          pytest -v google/antigravity/utils/
