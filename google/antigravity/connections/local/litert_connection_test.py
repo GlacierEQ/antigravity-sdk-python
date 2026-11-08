@@ -219,6 +219,10 @@ from google.antigravity.tools import tool_runner as tool_runner_mod
 
 # pylint: enable=g-import-not-at-top
 
+litert_connection.litert_lm = mock_litert
+litert_connection._LITERT_AVAILABLE = True
+litert_server.litert_lm = mock_litert
+litert_server._LITERT_AVAILABLE = True
 
 _urlopen_no_proxy = litert_connection._urlopen_no_proxy
 

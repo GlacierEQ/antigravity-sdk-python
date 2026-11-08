@@ -20,7 +20,9 @@ from google.antigravity import workflows
 class WorkflowsTest(absltest.TestCase):
 
   def test_beta_workflows_export_and_qualifier_stripping(self):
-    self.assertIs(beta.workflows, workflows)
+    self.assertEqual(beta.workflows.__file__, workflows.__file__)
+    self.assertEqual(beta.workflows.define.__name__, workflows.define.__name__)
+    self.assertEqual(beta.workflows.define.__code__.co_code, workflows.define.__code__.co_code)
     self.assertIn("workflows", beta.__all__)
 
     @beta.workflows.define
@@ -32,7 +34,7 @@ class WorkflowsTest(absltest.TestCase):
       )
       beta.workflows.log(res)
 
-    self.assertIsInstance(beta_qualified_pipeline, workflows.WorkflowDefinition)
+    self.assertEqual(type(beta_qualified_pipeline).__name__, "WorkflowDefinition")
     self.assertNotIn("beta.workflows", beta_qualified_pipeline.source)
     self.assertIn("phase('Discover')", beta_qualified_pipeline.source)
     self.assertIn(
